@@ -1,0 +1,59 @@
+# Build outputs.
+/build/
+/dist/
+/out/
+/bin/
+/obj/
+/.vs/
+/.vscode/
+/.idea/
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+*.exe
+*.idb
+*.i64
+
+# Local runtime data.
+*.log
+*.jsonl
+hg-bridge-nwsync.env
+__pycache__/
+*.py[cod]
+
+# Proprietary/local game content. Keep assets beside the code, not in Git.
+/hg-bridge-assets/*
+!/hg-bridge-assets/README.md
+!/hg-bridge-assets/.gitignore
+*.hak
+*.tlk
+*.key
+*.bif
+*.erf
+*.mod
+*.nwm
+*.sav
+*.2da
+*.mdl
+*.tga
+*.dds
+*.plt
+*.wav
+*.bmu
+
+# Archives and packages.
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+
+# OS/editor noise.
+Thumbs.db
+desktop.ini
+*.tmp
+*.bak
+*.swp
