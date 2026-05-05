@@ -78,8 +78,9 @@ List configured HG endpoints:
 
 ## Asset And NWSync Setup
 
-Keep local assets under `hg-bridge-assets`. The folder is ignored by Git on
-purpose.
+Keep local assets under `hg-bridge-assets`, or pass a different asset root when
+running the helper scripts. Game content, generated NWSync repositories,
+account files, CD keys, and logs are local-only data and are not included here.
 
 Minimum expected staging shape:
 
@@ -107,7 +108,6 @@ Generate a local NWSync repository:
 
 After a successful `-Apply`, the helper writes `hg-bridge-nwsync.env` with
 `HG_BRIDGE_NWSYNC_ROOT`, `HG_BRIDGE_NWSYNC_HASH`, and `HG_BRIDGE_NWSYNC_URL`.
-That env file is also ignored by Git.
 
 ## Run The Proxy
 
@@ -143,9 +143,9 @@ Current stock-EE proof-of-concept bundle:
 ```
 
 `--diamond-cdkey` points to a local Diamond-format `nwncdkey.ini`; it is used to
-synthesize the legacy verifier sent to HG. Do not commit that file. This is not
-proper multi-user authentication; it is a one-local-player-at-a-time bridge
-mechanism until the CD-key/account path is redesigned.
+synthesize the legacy verifier sent to HG. This is not proper multi-user
+authentication; it is a one-local-player-at-a-time bridge mechanism until the
+CD-key/account path is redesigned.
 
 For local stock EE proxy testing:
 
@@ -157,16 +157,56 @@ For local stock EE proxy testing:
   -NwsyncRoot .\hg-bridge-assets\nwsync
 ```
 
-## Run The Harness
+## Run The Harnessed Client Directly
 
-The harness path injects `nwncx_hg.dll` into a local NWN:EE client and uses the
-launcher to drive local compatibility tests. This is currently the more useful
-path, but it is still a harness with known bugs and crashes.
+The harnessed client path is the current direct-play path. It launches a local
+NWN:EE client, injects `nwncx_hg.dll`, enables the compatibility hooks, and
+connects directly to the selected HG 1.69 server. It does not use the standalone
+proxy.
+
+The harness needs local paths for:
+
+- the NWN:EE install root, so the launcher can find `nwmain.exe`
+- the bridge asset bundle, used for HG/CEP content and any Diamond-era resources
+  needed by the compatibility hooks
+- a Diamond-format account config folder, used for the legacy CD-key/password
+  files expected by HG
+- optionally, an explicit server password with `-Password`
+
+Example path setup:
 
 ```powershell
-.\tools\test-hg-bridge.ps1 -Server 213 -DriverOnly -Launch
+$EeRoot = 'C:\Program Files (x86)\Steam\steamapps\common\Neverwinter Nights'
+$AssetRoot = 'C:\Games\NWN-EE-Bridge\hg-bridge-assets'
+$DiamondConfigRoot = 'C:\Games\NWN-Diamond-Accounts'
 ```
 
-Most harness options are local-test conveniences. Use `-SteamRoot`,
-`-DiamondConfigRoot`, `-AssetBundleRoot`, and `-Password` to point the helper at
-your own local install, credentials, and assets. Keep those files outside Git.
+Launch through the helper script:
+
+```powershell
+.\tools\test-hg-bridge.ps1 `
+  -Server 213 `
+  -Launch `
+  -SkipAssets `
+  -SteamRoot $EeRoot `
+  -DiamondAccount 1 `
+  -DiamondConfigRoot $DiamondConfigRoot `
+  -AssetBundleRoot $AssetRoot
+```
+
+You can also launch directly without the helper:
+
+```powershell
+.\build\Release\hgbridge_launcher.exe `
+  --server 213 `
+  --ee "$EeRoot\bin\win32\nwmain.exe" `
+  --diamond-account 1 `
+  --diamond-config-root $DiamondConfigRoot `
+  --dll .\build\Release\nwncx_hg.dll
+```
+
+`-DiamondConfigRoot` / `--diamond-config-root` should contain the local
+Diamond-format account files for the selected account, such as
+`1.nwncdkey.ini` and `1.nwnplayer.ini`. The launcher uses those local files to
+seed the legacy CD-key and password paths expected by HG. Keep credentials and
+CD-key files private.
