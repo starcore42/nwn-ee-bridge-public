@@ -189,17 +189,3 @@ path, but it is still a harness with known bugs and crashes.
 Most harness options are local-test conveniences. Use `-SteamRoot`,
 `-DiamondConfigRoot`, `-AssetBundleRoot`, and `-Password` to point the helper at
 your own local install, credentials, and assets. Keep those files outside Git.
-
-## Publishing To GitHub
-
-After reviewing the files, create a GitHub repo and add it as `origin`:
-
-```powershell
-git remote add origin https://github.com/<you>/<repo>.git
-git branch -M main
-git push -u origin main
-```
-
-Choose and add a project license before publishing if you want other people to
-have explicit reuse rights. The vendored third-party dependencies keep their own
-licenses in their respective folders.
