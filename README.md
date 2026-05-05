@@ -5,11 +5,6 @@ Edition clients to legacy NWN 1.69 Higher Ground endpoints.
 
 This is not a finished bridge or a user-ready release. It is a research and
 development snapshot.
-
-This public repo contains only source code, helper scripts, and open-source
-third-party dependencies. It does not include game assets, HAK/TLK files,
-NWSync repositories, CD keys, account files, decompile dumps, logs, or binaries.
-
 ## Contents
 
 - `src/proxy`: `hgbridge_proxy.exe`, a standalone UDP proxy with EE crypto,
