@@ -5,20 +5,6 @@ Edition clients to legacy NWN 1.69 Higher Ground endpoints.
 
 This is not a finished bridge or a user-ready release. It is a research and
 development snapshot.
-## Contents
-
-- `src/proxy`: `hgbridge_proxy.exe`, a standalone UDP proxy with EE crypto,
-  packet rewrite, and NWSync advertisement/HTTP serving experiments.
-- `src/bridge`: `nwncx_hg.dll`, the injected local harness used for compatibility
-  testing against an EE client process.
-- `src/launcher`: `hgbridge_launcher.exe`, a small launcher/injector for the
-  harness DLL.
-- `tools`: build, NWSync, stock-proxy, and harness test helpers.
-- `third_party/miniz`: zlib/deflate support used by the proxy.
-- `third_party/libhydrogen-legacy-nwn`: bundled legacy libhydrogen source used
-  for NWN:EE BNK/encrypted-packet experiments.
-- `hg-bridge-assets`: ignored local staging folder for assets and generated
-  NWSync repositories.
 
 ## Current State
 
