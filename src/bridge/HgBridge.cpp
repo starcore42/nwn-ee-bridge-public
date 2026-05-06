@@ -20,7 +20,7 @@
 
 namespace {
 
-constexpr wchar_t kBridgeVersion[] = L"0.1.16";
+constexpr wchar_t kBridgeVersion[] = L"0.1.19";
 constexpr uint16_t kEeBuildField = 0x0003;
 constexpr uint16_t kDiamondBncsBuildField = 0x0003;
 constexpr uint16_t kSinfarBncsBuildField = 0x05F8;
@@ -856,6 +856,10 @@ std::wstring LowerAscii(std::wstring value) {
 bool IsTruthyEnvironmentFlag(const wchar_t* name) {
   const std::wstring value = LowerAscii(GetEnvironmentString(name));
   return value == L"1" || value == L"true" || value == L"yes" || value == L"on";
+}
+
+bool DriverOnlyProtocolCompatibilityDisabled() {
+  return IsTruthyEnvironmentFlag(L"HG_BRIDGE_DRIVER_ONLY");
 }
 
 const wchar_t* GetEnvironmentAliasName(const wchar_t* name) {
@@ -8343,7 +8347,9 @@ std::wstring LookupMajorMinorNameWide(unsigned char major, unsigned char minor) 
 
 bool ShouldForceLegacyServerFeatureGate(void* return_address, int build, int feature, int revision) {
   (void)revision;
-  if (!g_auto_connect_ip_known || IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_SERVER_FEATURE_GATE")) {
+  if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
+      IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_SERVER_FEATURE_GATE")) {
     return false;
   }
   if (build != 0x2001) {
@@ -8392,6 +8398,7 @@ bool ShouldForceLiveVisualTransformFeatureGate(void* return_address, int build, 
 bool ShouldSkipLegacyLiveVisualTransformRead(void* return_address) {
   (void)return_address;
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       !IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_VISUAL_TRANSFORM_SKIP") &&
       g_server_to_player_message_depth > 0 &&
       g_live_game_object_update_depth > 0 &&
@@ -8401,6 +8408,7 @@ bool ShouldSkipLegacyLiveVisualTransformRead(void* return_address) {
 
 bool ShouldSkipLegacyLiveMaterialShaderParamCount(void* return_address) {
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       !IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_MATERIAL_SHADER_PARAM_SKIP") &&
       g_server_to_player_message_depth > 0 &&
       g_live_game_object_update_depth > 0 &&
@@ -8413,6 +8421,7 @@ bool ShouldSkipLegacyLiveMaterialShaderParamCount(void* return_address) {
 
 bool IsLegacyLiveExtendedArmorTableByteRead(void* return_address) {
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       !IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_EXTENDED_ARMOR_TABLE_SKIP") &&
       g_live_game_object_update_depth > 0 &&
       g_current_server_to_player_major == 5 &&
@@ -8426,6 +8435,7 @@ bool ShouldSkipLegacyLiveCreatureUpdateTailByteAtEnd(
     void* return_address,
     const CnwMessageReadState& state) {
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_CREATURE_TAIL_BYTE_SKIP") ||
       g_server_to_player_message_depth <= 0 ||
       g_live_game_object_update_depth <= 0 ||
@@ -8448,6 +8458,7 @@ bool ShouldSuppressLegacyLiveCreatureUpdateTailReadAtEnd(
     void* return_address,
     const CnwMessageReadState& state) {
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_CREATURE_TAIL_EXACT_END_SUPPRESS") ||
       g_server_to_player_message_depth <= 0 ||
       g_live_game_object_update_depth <= 0 ||
@@ -9782,8 +9793,7 @@ void TryDispatchPendingAutoUseObject(void* message, LONG server_dispatch) {
           &transition_z,
           &transition_action_object_id,
           &transition_action_byte);
-  if (transition_click_available &&
-      ShouldOpenDoorBeforeAutoTransitionClick(entry) &&
+  if (ShouldOpenDoorBeforeAutoTransitionClick(entry) &&
       InterlockedCompareExchange(&g_pending_auto_use_door_open_phase, 1, 0) == 0) {
     sent_door_open = true;
     const DWORD door_transition_delay_ms =
@@ -10156,15 +10166,43 @@ bool TryFormatLegacyLiveObjectPacketSummary(
     bool short_locstring_known = false;
     uint32_t strref = 0;
     size_t name_offset = 0;
+    const size_t object_start = offset + 2;
+    std::array<size_t, 4> name_offsets{};
+    size_t name_offset_count = 0;
+    auto add_name_offset = [&](size_t candidate) {
+      if (candidate == 0) {
+        return;
+      }
+      for (size_t i = 0; i < name_offset_count; ++i) {
+        if (name_offsets[i] == candidate) {
+          return;
+        }
+      }
+      if (name_offset_count < name_offsets.size()) {
+        name_offsets[name_offset_count++] = candidate;
+      }
+    };
+
     if (object_type == 10 && first_known) {
-      name_offset = first_dword == 0 ? 12 : 8;
+      if (opcode == 'A') {
+        add_name_offset(first_dword == 0 ? 12 : 8);
+        // The proxy-side EE door-add translation inserts the 40-byte
+        // visual-transform map before the name, so driver-only scans need to
+        // recognize both the legacy and rewritten shapes.
+        add_name_offset(first_dword == 0 ? 52 : 48);
+      } else {
+        add_name_offset(first_dword == 0 ? 12 : 8);
+      }
     } else if (object_type == 9 || object_type == 5) {
-      name_offset = 4;
+      add_name_offset(4);
     }
 
-    const size_t object_start = offset + 2;
-    const size_t name_start = name_offset != 0 ? object_start + name_offset : bytes.size();
-    if (name_start < bytes.size()) {
+    for (size_t i = 0; i < name_offset_count && !inline_name_known && !short_locstring_known; ++i) {
+      name_offset = name_offsets[i];
+      const size_t name_start = object_start + name_offset;
+      if (name_start >= bytes.size()) {
+        continue;
+      }
       inline_name_known =
           LooksLikeInlineCExoStringAt(bytes, name_start, &inline_name_length, &inline_name_end, &inline_name);
       if (!inline_name_known &&
@@ -10364,6 +10402,7 @@ bool TryIdentifyLegacyLiveNameLocStringFlag(
   }
 
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_NAME_LOCSTRING_FLAG") ||
       g_server_to_player_message_depth <= 0 ||
       g_live_game_object_update_depth <= 0 ||
@@ -10423,6 +10462,7 @@ bool TryPlanLegacyLiveBadInlineLocStringSkip(
   }
 
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_BAD_INLINE_LOCSTRING_SKIP") ||
       g_server_to_player_message_depth <= 0 ||
       g_live_game_object_update_depth <= 0 ||
@@ -10613,7 +10653,8 @@ bool ShouldSuppressLegacyLiveParserBoundaryRead(
     detail->clear();
   }
 
-  if (IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_PARSER_BOUNDARY_GUARD") ||
+  if (DriverOnlyProtocolCompatibilityDisabled() ||
+      IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_PARSER_BOUNDARY_GUARD") ||
       ReturnAddressMatchesMainRva(return_address, kEeClientLiveGameObjectUpdateSubOpcodeReturnRva)) {
     return false;
   }
@@ -11240,7 +11281,8 @@ bool TryForceLegacyLiveShortAddLocStringInnerFlag(
     const wchar_t** label,
     uint32_t* strref,
     uint32_t* boundary_delta) {
-  if (!ReturnAddressMatchesMainRva(return_address, kEeClientReadCExoLocStringClientTlkFlagReturnRva) ||
+  if (DriverOnlyProtocolCompatibilityDisabled() ||
+      !ReturnAddressMatchesMainRva(return_address, kEeClientReadCExoLocStringClientTlkFlagReturnRva) ||
       !PendingLegacyLiveShortAddMatches(message, before, true) ||
       g_pending_legacy_live_short_add_parse.name_consumed) {
     return false;
@@ -11266,7 +11308,8 @@ bool TryForceLegacyLiveShortAddTailBool(
     const wchar_t** label,
     uint32_t* boundary_remaining) {
   const PendingLegacyLiveShortAddParse& pending = g_pending_legacy_live_short_add_parse;
-  if (!pending.active ||
+  if (DriverOnlyProtocolCompatibilityDisabled() ||
+      !pending.active ||
       !pending.name_consumed ||
       !PendingLegacyLiveShortAddMatches(message, before, false) ||
       !IsLegacyLiveShortAddTailBoolReturnAddress(return_address, pending.object_type)) {
@@ -11311,7 +11354,8 @@ bool TryConsumePendingLegacyLiveShortAddNameString(
   }
 
   const PendingLegacyLiveShortAddParse& pending = g_pending_legacy_live_short_add_parse;
-  if (!ReturnAddressMatchesMainRva(return_address, kEeClientReadCExoLocStringClientStringReturnRva) ||
+  if (DriverOnlyProtocolCompatibilityDisabled() ||
+      !ReturnAddressMatchesMainRva(return_address, kEeClientReadCExoLocStringClientStringReturnRva) ||
       !pending.active ||
       !pending.locstring_flag_forced ||
       pending.name_consumed ||
@@ -11564,6 +11608,7 @@ bool PendingLegacyLiveTriggerAddMatches(
 bool TryQueueLegacyLiveTriggerAddParse(void* message) {
   ClearPendingLegacyLiveTriggerAddParse();
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_TRIGGER_ADD_PARSE") ||
       g_server_to_player_message_depth <= 0 ||
       g_live_game_object_update_depth <= 0 ||
@@ -11718,7 +11763,8 @@ bool TryForceLegacyLiveTriggerAddLocStringInnerFlag(
     const CnwMessageReadState& before,
     uint32_t* strref,
     uint32_t* boundary_delta) {
-  if (!ReturnAddressMatchesMainRva(return_address, kEeClientReadCExoLocStringClientTlkFlagReturnRva) ||
+  if (DriverOnlyProtocolCompatibilityDisabled() ||
+      !ReturnAddressMatchesMainRva(return_address, kEeClientReadCExoLocStringClientTlkFlagReturnRva) ||
       !PendingLegacyLiveTriggerAddMatches(message, before, true) ||
       g_pending_legacy_live_trigger_add_parse.name_consumed) {
     return false;
@@ -11735,7 +11781,8 @@ bool TryForceLegacyLiveTriggerAddLocStringInnerFlag(
 }
 
 bool ShouldCheckLegacyLiveTriggerAddNameString(void* return_address) {
-  return g_pending_legacy_live_trigger_add_parse.active &&
+  return !DriverOnlyProtocolCompatibilityDisabled() &&
+      g_pending_legacy_live_trigger_add_parse.active &&
       ReturnAddressMatchesMainRva(return_address, kEeClientReadCExoLocStringClientStringReturnRva);
 }
 
@@ -11766,7 +11813,8 @@ bool TryConsumePendingLegacyLiveTriggerAddNameString(
   }
 
   const PendingLegacyLiveTriggerAddParse& pending = g_pending_legacy_live_trigger_add_parse;
-  if (!ReturnAddressMatchesMainRva(return_address, kEeClientReadCExoLocStringClientStringReturnRva) ||
+  if (DriverOnlyProtocolCompatibilityDisabled() ||
+      !ReturnAddressMatchesMainRva(return_address, kEeClientReadCExoLocStringClientStringReturnRva) ||
       !pending.active ||
       !pending.locstring_flag_forced ||
       pending.name_consumed ||
@@ -11835,7 +11883,8 @@ bool TryConsumeLegacyLiveTriggerAddPrimaryBool(
   }
 
   PendingLegacyLiveTriggerAddParse& pending = g_pending_legacy_live_trigger_add_parse;
-  if (!ReturnAddressMatchesMainRva(return_address, kEeClientLiveTriggerPostNamePrimaryBoolReturnRva) ||
+  if (DriverOnlyProtocolCompatibilityDisabled() ||
+      !ReturnAddressMatchesMainRva(return_address, kEeClientLiveTriggerPostNamePrimaryBoolReturnRva) ||
       !pending.active ||
       !pending.name_consumed ||
       pending.legacy_primary_flag_consumed ||
@@ -11885,7 +11934,8 @@ bool TryForceLegacyLiveTriggerAddSyntheticBool(
   }
 
   const PendingLegacyLiveTriggerAddParse& pending = g_pending_legacy_live_trigger_add_parse;
-  if (!pending.active ||
+  if (DriverOnlyProtocolCompatibilityDisabled() ||
+      !pending.active ||
       !pending.name_consumed ||
       !PendingLegacyLiveTriggerAddMatches(message, before, false)) {
     return false;
@@ -11911,7 +11961,8 @@ bool TryForceLegacyLiveTriggerAddSyntheticBool(
 }
 
 bool IsLegacyLiveTriggerAddSyntheticCursorByteReturn(void* return_address) {
-  return ReturnAddressMatchesMainRva(return_address, kEeClientLiveTriggerPostNameCursorByteReturnRva);
+  return !DriverOnlyProtocolCompatibilityDisabled() &&
+      ReturnAddressMatchesMainRva(return_address, kEeClientLiveTriggerPostNameCursorByteReturnRva);
 }
 
 bool TryForceLegacyLiveTriggerAddSyntheticCursorByte(
@@ -11949,6 +12000,7 @@ bool TryForceLegacyLiveTriggerAddSyntheticCursorByte(
 
 bool ShouldCheckLegacyLiveUpdateNameString(void* return_address) {
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       !IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_UPDATE_NAME_RECOVER") &&
       !IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_DOOR_UPDATE_NAME_RECOVER") &&
       g_server_to_player_message_depth > 0 &&
@@ -11961,6 +12013,7 @@ bool ShouldCheckLegacyLiveUpdateNameString(void* return_address) {
 
 bool IsLegacyLivePacketReadContext() {
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       g_server_to_player_message_depth > 0 &&
       g_live_game_object_update_depth > 0 &&
       g_current_server_to_player_major == 5 &&
@@ -13219,6 +13272,7 @@ bool TrySkipLegacyLiveShortAddRecord(
     uint8_t object_type,
     const wchar_t* label) {
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_SHORT_ADD_SKIP") ||
       g_server_to_player_message_depth <= 0 ||
       g_live_game_object_update_depth <= 0 ||
@@ -13354,6 +13408,7 @@ bool TrySkipLegacyLiveShortAddRecord(
 
 bool TrySkipLegacyLiveTriggerAddRecord(void* message) {
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_TRIGGER_ADD_SKIP") ||
       g_server_to_player_message_depth <= 0 ||
       g_live_game_object_update_depth <= 0 ||
@@ -13687,6 +13742,7 @@ bool TryConsumeLegacyLiveScalarTail(
 
 bool ShouldResyncLegacyLiveObjectSubMessageBoundary(void* return_address, const CnwMessageReadState& state) {
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       !IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_SUBOPCODE_RESYNC") &&
       g_server_to_player_message_depth > 0 &&
       g_live_game_object_update_depth > 0 &&
@@ -13905,6 +13961,7 @@ bool TryRemapLegacyInventoryEquipInitialObjectId(
     *remapped_object_id = 0;
   }
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_INVENTORY_EQUIP_OBJECT_REMAP") ||
       g_server_to_player_message_depth <= 0 ||
       g_current_server_to_player_major != 12 ||
@@ -14014,6 +14071,7 @@ bool ShouldSkipLegacyLiveExtendedArmorTableByte(
 
 bool ShouldCheckLegacyLiveOversizedCExoString() {
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       !IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_OVERSIZED_STRING_SKIP") &&
       g_server_to_player_message_depth > 0 &&
       g_live_game_object_update_depth > 0 &&
@@ -14086,6 +14144,7 @@ bool LooksLikeOversizedLegacyLiveCExoString(
 bool ShouldRecoverLegacyLiveMisalignedCExoString(void* return_address) {
   UNREFERENCED_PARAMETER(return_address);
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       !IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_MISALIGNED_STRING_RECOVER") &&
       g_server_to_player_message_depth > 0 &&
       g_live_game_object_update_depth > 0 &&
@@ -14346,6 +14405,7 @@ void* CreateEmptyVisualTransformMap(void* visual_transform) {
 
 bool ShouldUseLegacyLiveItemAppearanceRead() {
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_ITEM_APPEARANCE_READ")) {
     return false;
   }
@@ -14754,6 +14814,7 @@ bool LegacyGameObjectUpdateFieldShimDisabled() {
 
 bool ShouldForceLegacyGameObjectUpdateField(void* return_address, size_t field_return_rva) {
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       g_game_object_update_depth > 0 &&
       !LegacyGameObjectUpdateFieldShimDisabled() &&
       ReturnAddressMatchesMainRva(return_address, field_return_rva);
@@ -14767,6 +14828,7 @@ bool ShouldForceLegacyGameObjectUpdateBool(void* return_address) {
 
 bool ShouldForceLegacyLiveInlineLocStringFlag(void* return_address) {
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_INLINE_LOCSTRING") ||
       !ReturnAddressMatchesMainRva(
           return_address,
@@ -14789,6 +14851,7 @@ bool ShouldForceLegacyLiveInlineLocStringFlag(void* return_address) {
 
 bool ShouldSkipLegacyLiveItemEeOnlyBool(void* return_address) {
   return g_auto_connect_ip_known &&
+      !DriverOnlyProtocolCompatibilityDisabled() &&
       !IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_ITEM_EXTRA_BOOL_SKIP") &&
       g_server_to_player_message_depth > 0 &&
       g_live_game_object_update_depth > 0 &&
@@ -14804,6 +14867,7 @@ bool ShouldSkipLegacyLivePlaceableAddAbsentBool(void* return_address, const wcha
     *skipped_field = L"";
   }
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_PLACEABLE_ABSENT_BOOL_SKIP") ||
       g_server_to_player_message_depth <= 0 ||
       g_live_game_object_update_depth <= 0 ||
@@ -15686,6 +15750,7 @@ bool ShouldConsumeLegacyLiveObjectUpdateTail(
     void* return_address,
     const CnwMessageReadState& state) {
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_OBJECT_UPDATE_TAIL_CONSUME")) {
     return false;
   }
@@ -15736,6 +15801,7 @@ bool ShouldConsumeLegacyObjectUpdateFragmentTail(
     void* return_address,
     const CnwMessageReadState& state) {
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_OBJECT_UPDATE_FRAGMENT_TAIL_CONSUME")) {
     return false;
   }
@@ -15808,6 +15874,7 @@ bool ShouldSkipLegacyLiveGenericObjectUpdateTrailingWord(
     int bit_count,
     const CnwMessageReadState& state) {
   if (!g_auto_connect_ip_known ||
+      DriverOnlyProtocolCompatibilityDisabled() ||
       IsTruthyEnvironmentFlag(L"HG_BRIDGE_DISABLE_LEGACY_LIVE_TRAILING_WORD_SKIP") ||
       g_server_to_player_message_depth <= 0 ||
       g_live_game_object_update_depth <= 0 ||
@@ -16774,6 +16841,7 @@ int __fastcall HookedMessageReadBool(void* message) {
 
 char __fastcall HookedMessageReadChar(void* message, int bit_count) {
   void* const return_address = _ReturnAddress();
+  const bool driver_only_passthrough = DriverOnlyProtocolCompatibilityDisabled();
   const bool trace_module = g_module_read_diagnostics_enabled && g_client_module_load_depth > 0;
   const bool trace_area = ShouldTraceAreaMessageRead(return_address);
   const bool trace_live = ShouldTraceLiveMessageRead(return_address);
@@ -16781,6 +16849,7 @@ char __fastcall HookedMessageReadChar(void* message, int bit_count) {
       ReturnAddressMatchesMainRva(return_address, kEeClientLiveGameObjectUpdateSubOpcodeReturnRva);
   const bool should_handle_live_subopcode =
       live_subopcode &&
+      !driver_only_passthrough &&
       g_auto_connect_ip_known &&
       g_server_to_player_message_depth > 0 &&
       g_live_game_object_update_depth > 0 &&
@@ -19378,6 +19447,7 @@ int64_t __fastcall HookedClientSendPlayerToServerMessageDriverOnly(
   const LONG observation = InterlockedIncrement(&g_client_to_server_message_observations);
   const std::wstring name = LookupMajorMinorNameWide(major, minor);
   const bool is_area_loaded = major == 4 && minor == 3;
+  const bool is_party_get_list = major == 14 && minor == 2;
   const bool is_input = major == 6;
   const bool is_load_or_area_related = major == 2 || major == 3 || major == 4 || major == 44;
   const bool is_gui_inventory = major == 13;
@@ -19451,6 +19521,8 @@ int64_t __fastcall HookedClientSendPlayerToServerMessageDriverOnly(
   }
   if (is_area_loaded) {
     ScheduleDriverAutoOpenInventory(message, L"Area_AreaLoaded", observation);
+  } else if (is_party_get_list) {
+    ScheduleDriverAutoOpenInventory(message, L"Party_GetList", observation);
   }
   return result;
 }
@@ -25866,6 +25938,11 @@ AutoConnectAttemptResult TryAutoConnect(const EeConnectApi& api, const std::wstr
   return invoked ? AutoConnectAttemptResult::kInvoked : AutoConnectAttemptResult::kFailed;
 }
 
+bool DriverOnlyAutoConnectCompletionObserved() {
+  return InterlockedCompareExchange(&g_server_to_player_message_observations, 0, 0) != 0 ||
+      InterlockedCompareExchange(&g_auto_character_state, 0, 0) != 0;
+}
+
 DWORD WINAPI AutoConnectThread(LPVOID) {
   const std::wstring host = g_auto_connect_host;
   const unsigned short port = g_auto_connect_port;
@@ -25887,6 +25964,10 @@ DWORD WINAPI AutoConnectThread(LPVOID) {
       LogFormat(L"auto-connect complete: target address translation was observed");
       return 1;
     }
+    if (driver_only && DriverOnlyAutoConnectCompletionObserved()) {
+      LogFormat(L"auto-connect complete before retry: driver-only server message or auto-character observation was seen");
+      return 1;
+    }
 
     const AutoConnectAttemptResult result = TryAutoConnect(api, host, port, attempt);
     if (result == AutoConnectAttemptResult::kInvoked) {
@@ -25898,8 +25979,7 @@ DWORD WINAPI AutoConnectThread(LPVOID) {
 
         for (int wait = 0; wait < 16; ++wait) {
           Sleep(500);
-          if (InterlockedCompareExchange(&g_server_to_player_message_observations, 0, 0) != 0 ||
-              InterlockedCompareExchange(&g_auto_character_state, 0, 0) != 0) {
+          if (DriverOnlyAutoConnectCompletionObserved()) {
             LogFormat(L"auto-connect complete: driver-only server message observation was seen");
             return 1;
           }

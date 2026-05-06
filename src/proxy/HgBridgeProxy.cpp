@@ -35,7 +35,7 @@
 
 namespace {
 
-constexpr wchar_t kProxyVersion[] = L"0.5.304";
+constexpr wchar_t kProxyVersion[] = L"0.5.352";
 constexpr uint16_t kDiamondBncsBuildField = 0x0003;
 constexpr uint32_t kNwn169PrivateBuild = 8109;
 constexpr size_t kLegacyGameplayPayloadOffset = 12;
@@ -45,6 +45,8 @@ constexpr uint32_t kMaxReasonableModuleResourceCount = 100000;
 constexpr uint32_t kMaxReasonableLoadModuleAreaNameLength = 512;
 constexpr uint32_t kLoadModuleZeroNameTerminatorMinEntries = 32;
 constexpr uint16_t kSyntheticAreaLoadBarFrameCount = 2;
+constexpr uint32_t kDefaultSyntheticAreaLoadCompletionDelayMs = 6500;
+constexpr uint32_t kDefaultSyntheticAreaLoadedFallbackGraceMs = 2000;
 constexpr uint32_t kMaxReasonableReassembledGameplayPayload = 1024 * 1024;
 constexpr size_t kMaxGameplayReassemblyFrames = 256;
 constexpr size_t kMaxInterleavedDeflatedGameplayPackets = 32;
@@ -81,10 +83,15 @@ constexpr uint32_t kEeLiveObjectVisualTransformMapMask = 0x00000008u;
 constexpr uint32_t kEeLiveObjectVisualTransformMask = 0x00100000u;
 constexpr uint32_t kEeLiveObjectMaterialShaderParamMask = 0x00200000u;
 constexpr uint32_t kLegacyLiveObjectUpdatePositionMask = 0x00000001u;
+constexpr uint32_t kLegacyLiveObjectUpdateOrientationMask = 0x00000002u;
+constexpr uint32_t kLegacyLiveObjectUpdateScaleStateMask = 0x00000004u;
 constexpr uint32_t kLegacyLiveObjectUpdateStateMask = 0x00000010u;
 constexpr uint32_t kLegacyLiveObjectUpdateNameMask = 0x00080000u;
 constexpr size_t kLegacyLiveObjectUpdatePositionReadBytes = 6;
 constexpr size_t kLegacyLiveObjectUpdatePositionFragmentBits = 2;
+constexpr size_t kEeLiveObjectUpdateOrientationScalarReadBytes = 1;
+constexpr size_t kEeLiveObjectUpdateOrientationScalarFragmentBits = 5;
+constexpr size_t kEeLiveObjectUpdateScaleStateReadBytes = 6;
 constexpr size_t kLegacyLiveObjectUpdateStateFragmentBits = 5;
 constexpr uint32_t kLegacyLiveCreatureUpdateAssociateMask = 0x00002000u;
 constexpr uint16_t kLegacyLiveInventorySimpleCategoryMask = 0x0010u;
@@ -219,6 +226,7 @@ struct Options {
   bool rewrite_area_client_area = false;
   bool synthesize_area_loadbar = true;
   bool synthesize_area_loaded = false;
+  uint32_t synthetic_area_load_completion_delay_ms = kDefaultSyntheticAreaLoadCompletionDelayMs;
   bool enable_nwsync_advertisement = false;
   bool enable_nwsync_http = false;
   uint32_t session_timeout_ms = 300000;
@@ -292,6 +300,12 @@ struct PeerAddress {
 
 struct PendingPacket {
   std::vector<unsigned char> bytes;
+};
+
+struct PendingServerPacket {
+  std::vector<unsigned char> bytes;
+  ULONGLONG due_tick = 0;
+  std::wstring reason;
 };
 
 struct ReassembledGameplayFrame {
@@ -374,6 +388,61 @@ struct ServerSequenceShift {
   uint16_t delta = 0;
 };
 
+struct AreaPlaceableContextRow {
+  uint32_t object_id = 0;
+  uint16_t appearance = 0;
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+  float dir_x = 0.0f;
+  float dir_y = 0.0f;
+  float dir_z = 0.0f;
+  bool has_direction = false;
+};
+
+struct LivePlaceableSemanticBits {
+  bool known = false;
+  int visual_selector = -1;
+  int visual_gate = -1;
+  int static_plot = -1;
+  int useable = -1;
+  int trap_disarmable = -1;
+  int lockable = -1;
+  int locked = -1;
+  int unknown_1ac = -1;
+  int name_valid = -1;
+  int light_is_on = -1;
+  int visual_payload = -1;
+};
+
+struct LivePlaceableAddContextRow {
+  uint32_t object_id = 0;
+  uint16_t appearance = 0;
+  std::string name;
+  bool has_add_record = false;
+  LivePlaceableSemanticBits add_state;
+  LivePlaceableSemanticBits latest_update_state;
+  uint32_t update_count = 0;
+  bool latest_update_has_position = false;
+  float latest_update_x = 0.0f;
+  float latest_update_y = 0.0f;
+  float latest_update_z = 0.0f;
+};
+
+struct LiveObjectLifecycleEntry {
+  unsigned char object_type = 0;
+  uint32_t object_id = 0;
+  bool active = false;
+  uint32_t add_count = 0;
+  uint32_t update_count = 0;
+  uint32_t property_count = 0;
+  uint32_t delete_count = 0;
+  uint64_t last_packet_index = 0;
+  size_t last_record_offset = 0;
+  unsigned char last_opcode = 0;
+  std::string latest_name;
+};
+
 struct BridgeRuntime {
   Options options;
   PeerAddress server_peer;
@@ -424,6 +493,8 @@ struct BridgeRuntime {
   uint64_t live_object_candidate_count = 0;
   uint64_t live_object_observed_count = 0;
   uint64_t live_object_summary_count = 0;
+  uint64_t live_object_lifecycle_observed_count = 0;
+  uint64_t live_object_lifecycle_suspicious_count = 0;
   uint64_t live_object_prefixed_fragment_normalize_count = 0;
   uint64_t live_object_prefixed_fragment_salvage_count = 0;
   uint64_t live_object_prefixed_fragment_salvage_byte_count = 0;
@@ -466,6 +537,7 @@ struct BridgeRuntime {
   uint64_t live_object_add_record_short_add_skip_byte_count = 0;
   uint64_t live_object_add_record_trigger_rewrite_count = 0;
   uint64_t live_object_add_record_bits_insert_count = 0;
+  uint64_t live_object_add_record_placeable_name_direct_repair_count = 0;
   uint64_t live_object_add_record_rewrite_skipped_count = 0;
   uint64_t live_object_add_visual_transform_rewrite_count = 0;
   uint64_t live_object_add_visual_transform_map_insert_count = 0;
@@ -526,6 +598,7 @@ struct BridgeRuntime {
   uint64_t area_client_area_loadbar_completion_count = 0;
   uint64_t area_client_area_loaded_deferred_count = 0;
   uint64_t area_client_area_loaded_released_count = 0;
+  uint64_t area_client_area_loaded_canceled_count = 0;
   uint64_t area_client_area_loaded_synthetic_count = 0;
   uint64_t client_charlist_request_observed_count = 0;
   uint64_t client_play_module_character_list_start_observed_count = 0;
@@ -544,6 +617,7 @@ struct BridgeRuntime {
   uint64_t quickbar_item_rewrite_count = 0;
   uint64_t quickbar_item_buttons_translated_count = 0;
   uint64_t quickbar_item_buttons_blanked_count = 0;
+  uint64_t quickbar_item_type_tag_recovery_count = 0;
   uint64_t quickbar_reassembly_started_count = 0;
   uint64_t quickbar_reassembly_completed_count = 0;
   uint64_t quickbar_reassembly_rewritten_count = 0;
@@ -574,11 +648,21 @@ struct BridgeRuntime {
   GameplayReassemblyState server_quickbar_reassembly;
   GameplayReassemblyState server_live_object_reassembly;
   std::string latest_bnxr_module_name;
+  std::string latest_area_resref;
+  std::vector<uint32_t> latest_area_placeable_light_ids;
+  std::vector<uint32_t> latest_area_static_placeable_ids;
+  std::vector<AreaPlaceableContextRow> latest_area_placeable_light_rows;
+  std::vector<AreaPlaceableContextRow> latest_area_static_placeable_rows;
+  std::vector<LivePlaceableAddContextRow> latest_live_placeable_add_rows;
+  std::vector<LiveObjectLifecycleEntry> latest_live_object_lifecycle_rows;
   std::vector<ServerSequenceShift> server_sequence_shifts;
   std::vector<ServerSequenceShift> client_sequence_shifts;
   std::vector<std::vector<unsigned char>> pending_client_to_server_packets;
+  std::vector<PendingServerPacket> pending_server_to_client_packets;
   bool have_latest_client_sequence_from_client = false;
   uint16_t latest_client_sequence_from_client = 0;
+  bool have_latest_client_ack_from_client = false;
+  uint16_t latest_client_ack_from_client = 0;
   bool pending_area_loadbar_completion = false;
   uint16_t pending_area_loadbar_after_sequence = 0;
   uint16_t pending_area_loadbar_ack_sequence = 0;
@@ -587,6 +671,7 @@ struct BridgeRuntime {
   bool pending_area_loaded_client_packet = false;
   uint16_t pending_area_loaded_server_ack_sequence = 0;
   uint16_t pending_area_loaded_release_client_ack_sequence = 0;
+  ULONGLONG pending_area_loaded_release_due_tick = 0;
   bool pending_server_sequence_shift_after_current = false;
   uint16_t pending_server_sequence_shift_base = 0;
   uint16_t pending_server_sequence_shift_delta = 0;
@@ -824,6 +909,8 @@ struct LiveAddRecordRewriteResult {
   uint32_t fragment_bits_trimmed = 0;
   uint32_t old_fragment_bytes = 0;
   uint32_t new_fragment_bytes = 0;
+  uint32_t placeable_name_mode_suspicious = 0;
+  uint32_t placeable_name_mode_direct_repairs = 0;
   std::wstring details;
   std::wstring diagnostics;
 };
@@ -933,6 +1020,7 @@ struct QuickbarButtonInventory {
   uint8_t spell_domain = 0;
   QuickbarItemObject primary_item;
   QuickbarItemObject secondary_item;
+  bool recovered_item_type_tag = false;
   size_t offset = 0;
   size_t next_offset = 0;
   size_t source_fragment_offset = 0;
@@ -974,8 +1062,10 @@ struct QuickbarFullParseView {
   int item_buttons_translated = 0;
   int item_buttons_blanked = 0;
   int unsupported_buttons_blanked = 0;
+  int item_type_tags_recovered = 0;
   std::array<QuickbarButtonInventory, kLegacyQuickbarButtonCount> buttons{};
   std::wstring button_summary;
+  std::wstring item_type_recovery_summary;
 };
 
 struct GameplayWrapperView {
@@ -1210,16 +1300,16 @@ void LogLine(std::wstring_view message) {
 }
 
 void LogFormat(const wchar_t* format, ...) {
-  wchar_t message[4096]{};
+  std::vector<wchar_t> message(32768);
   va_list args;
   va_start(args, format);
   const int written =
-      _vsnwprintf_s(message, _countof(message), _TRUNCATE, format, args);
+      _vsnwprintf_s(message.data(), message.size(), _TRUNCATE, format, args);
   va_end(args);
   if (written < 0 && message[0] == L'\0') {
-    wcscpy_s(message, L"<log formatting failed>");
+    wcscpy_s(message.data(), message.size(), L"<log formatting failed>");
   }
-  LogLine(message);
+  LogLine(message.data());
 }
 
 struct EeCryptoProvider {
@@ -1789,6 +1879,7 @@ void PrintUsage() {
   wprintf(L"                      [--rewrite-player-list]\n");
   wprintf(L"                      [--rewrite-area-client-area] [--no-synthetic-area-loadbar]\n");
   wprintf(L"                      [--synthetic-area-loaded]\n");
+  wprintf(L"                      [--synthetic-area-load-completion-delay-ms MS]\n");
   wprintf(L"                      [--nwsync-root PATH] [--nwsync-url URL] [--nwsync-hash SHA1]\n");
   wprintf(L"                      [--nwsync-manifest SHA1[:FLAGS[:LANG]]] [--nwsync-http [HOST:]PORT]\n");
   wprintf(L"                      [--session-timeout-ms MS]\n");
@@ -1797,6 +1888,10 @@ void PrintUsage() {
   wprintf(L"  --listen 127.0.0.1:5121\n");
   wprintf(L"  --server 111\n");
   wprintf(L"  --session-timeout-ms 300000 (0 disables idle cleanup)\n\n");
+  wprintf(
+      L"  --synthetic-area-load-completion-delay-ms %u; synthetic Area_AreaLoaded fallback grace %u ms\n\n",
+      kDefaultSyntheticAreaLoadCompletionDelayMs,
+      kDefaultSyntheticAreaLoadedFallbackGraceMs);
   wprintf(L"Current scope:\n");
   wprintf(L"  Multi-client plain UDP relay for the harnessed EE legacy path, with per-client BNCS/BNVR startup packet gating.\n");
   wprintf(L"  Can opt-in handle stock EE BNK and player-packet encryption with --ee-crypto.\n");
@@ -1940,7 +2035,9 @@ Options ParseArgs(int argc, wchar_t** argv) {
         arg == L"--nwsync-hash" || arg == L"--nwsync-repository-hash" ||
         arg == L"--nwsync-manifest" || arg == L"--nwsync-http" ||
         arg == L"--bncs-private-build" ||
-        arg == L"--rewrite-bncs-field" || arg == L"--session-timeout-ms") && i + 1 < argc) {
+        arg == L"--rewrite-bncs-field" || arg == L"--session-timeout-ms" ||
+        arg == L"--synthetic-area-load-completion-delay-ms" ||
+        arg == L"--area-load-completion-delay-ms") && i + 1 < argc) {
       const std::wstring value = argv[++i];
       if (arg == L"--listen") {
         if (!ParseListenEndpoint(value, &options.listen_host, &options.listen_port)) {
@@ -2026,6 +2123,14 @@ Options ParseArgs(int argc, wchar_t** argv) {
           ExitProcess(2);
         }
         options.session_timeout_ms = timeout;
+      } else if (arg == L"--synthetic-area-load-completion-delay-ms" ||
+          arg == L"--area-load-completion-delay-ms") {
+        uint32_t delay = 0;
+        if (!ParseUnsigned32(value, &delay)) {
+          fwprintf(stderr, L"Invalid --synthetic-area-load-completion-delay-ms value: %ls\n", value.c_str());
+          ExitProcess(2);
+        }
+        options.synthetic_area_load_completion_delay_ms = delay;
       }
     } else {
       fwprintf(stderr, L"Unknown or incomplete argument: %ls\n", arg.c_str());
@@ -2926,28 +3031,64 @@ void LoadDiamondCdKeys(BridgeRuntime* runtime) {
       path.c_str());
 }
 
-std::wstring FindDefaultBaseitemsPath() {
-  const std::array<const wchar_t*, 12> candidates = {
-      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\hg-gui\\hak\\cep2_custom.hak",
-      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\hg-std\\hak\\cep2_custom.hak",
-      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\diamond\\hak\\cep2_custom.hak",
-      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\cep23\\hak\\cep2_top_v23.hak",
-      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\diamond\\hak\\cep2_top_v24.hak",
-      L"hg-bridge-assets\\hg-gui\\hak\\cep2_custom.hak",
-      L"hg-bridge-assets\\hg-std\\hak\\cep2_custom.hak",
-      L"hg-bridge-assets\\diamond\\hak\\cep2_custom.hak",
+void AddExistingUniquePath(
+    std::vector<std::wstring>* paths,
+    const wchar_t* candidate) {
+  if (paths == nullptr || candidate == nullptr || candidate[0] == L'\0') {
+    return;
+  }
+  const std::wstring full = FullPath(candidate);
+  if (!FileExists(full)) {
+    return;
+  }
+  if (std::find(paths->begin(), paths->end(), full) == paths->end()) {
+    paths->push_back(full);
+  }
+}
+
+std::vector<std::wstring> FindDefaultBaseitemsPaths() {
+  std::vector<std::wstring> paths;
+  const std::array<const wchar_t*, 6> base_candidates = {
+      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\ee-fixes\\2da\\baseitems.2da",
+      L"hg-bridge-assets\\ee-fixes\\2da\\baseitems.2da",
       L"NWN Diamond\\1.72 builder resources\\auto2damerger\\merged\\baseitems.2da",
       L"NWN Diamond\\1.72 builder resources\\1.72 full 2dasource\\baseitems.2da",
       L"NWN Diamond\\1.72 builder resources\\1.72-hak 2das\\baseitems.2da",
       L"NWN Diamond\\1.72 builder resources\\1.72-only 2das\\baseitems.2da",
   };
-  for (const wchar_t* candidate : candidates) {
-    const std::wstring full = FullPath(candidate);
-    if (FileExists(full)) {
-      return full;
+  for (const wchar_t* candidate : base_candidates) {
+    const size_t before = paths.size();
+    AddExistingUniquePath(&paths, candidate);
+    if (paths.size() != before) {
+      break;
     }
   }
-  return {};
+
+  const std::array<const wchar_t*, 5> local_overlay_candidates = {
+      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\hg-gui\\hak\\cep2_custom.hak",
+      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\hg-std\\hak\\cep2_custom.hak",
+      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\diamond\\hak\\cep2_custom.hak",
+      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\cep23\\hak\\cep2_top_v23.hak",
+      L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\Neverwinter Nights\\hg-bridge-assets\\diamond\\hak\\cep2_top_v24.hak",
+  };
+  const size_t before_local_overlays = paths.size();
+  for (const wchar_t* candidate : local_overlay_candidates) {
+    AddExistingUniquePath(&paths, candidate);
+  }
+
+  const std::array<const wchar_t*, 5> workspace_overlay_candidates = {
+      L"hg-bridge-assets\\hg-gui\\hak\\cep2_custom.hak",
+      L"hg-bridge-assets\\hg-std\\hak\\cep2_custom.hak",
+      L"hg-bridge-assets\\diamond\\hak\\cep2_custom.hak",
+      L"hg-bridge-assets\\cep23\\hak\\cep2_top_v23.hak",
+      L"hg-bridge-assets\\diamond\\hak\\cep2_top_v24.hak",
+  };
+  if (paths.size() == before_local_overlays) {
+    for (const wchar_t* candidate : workspace_overlay_candidates) {
+      AddExistingUniquePath(&paths, candidate);
+    }
+  }
+  return paths;
 }
 
 bool ParseBaseItemModelTypes2da(std::string_view contents, std::vector<int8_t>* model_types) {
@@ -3025,54 +3166,168 @@ bool ParseBaseItemModelTypes2da(std::string_view contents, std::vector<int8_t>* 
   return known != 0;
 }
 
+bool LoadBaseItemModelTypesFromPath(
+    const std::wstring& path,
+    std::vector<int8_t>* model_types,
+    size_t* known_count) {
+  if (model_types == nullptr) {
+    return false;
+  }
+  if (known_count != nullptr) {
+    *known_count = 0;
+  }
+
+  std::string contents;
+  const bool read_ok = LooksLikeErfContainerPath(path)
+      ? ReadErfTextResource(path, "baseitems", &contents)
+      : ReadSmallTextFile(path, &contents);
+  if (!read_ok) {
+    return false;
+  }
+
+  std::vector<int8_t> parsed;
+  if (!ParseBaseItemModelTypes2da(contents, &parsed)) {
+    return false;
+  }
+
+  size_t known = 0;
+  for (int8_t value : parsed) {
+    if (value >= 0) {
+      ++known;
+    }
+  }
+  if (known_count != nullptr) {
+    *known_count = known;
+  }
+  *model_types = std::move(parsed);
+  return known != 0;
+}
+
+void OverlayBaseItemModelTypes(
+    std::vector<int8_t>* merged,
+    const std::vector<int8_t>& overlay) {
+  if (merged == nullptr) {
+    return;
+  }
+  if (merged->size() < overlay.size()) {
+    merged->resize(overlay.size(), -1);
+  }
+  for (size_t index = 0; index < overlay.size(); ++index) {
+    if (overlay[index] >= 0) {
+      (*merged)[index] = overlay[index];
+    }
+  }
+}
+
+std::wstring JoinBaseitemsSourcePaths(const std::vector<std::wstring>& paths) {
+  std::wstring result;
+  for (const std::wstring& path : paths) {
+    if (!result.empty()) {
+      result += L";";
+    }
+    result += path;
+  }
+  return result;
+}
+
+int GetModelTypeForLog(const std::vector<int8_t>& model_types, size_t row) {
+  if (row >= model_types.size()) {
+    return -1;
+  }
+  return static_cast<int>(model_types[row]);
+}
+
 void LoadBaseItemModelTypes(BridgeRuntime* runtime) {
   if (runtime == nullptr) {
     return;
   }
 
-  std::wstring path = runtime->options.baseitems_path;
-  if (path.empty()) {
-    path = GetEnvironmentString(L"HG_BRIDGE_BASEITEMS_PATH");
+  const bool explicit_path =
+      !runtime->options.baseitems_path.empty() ||
+      !GetEnvironmentString(L"HG_BRIDGE_BASEITEMS_PATH").empty();
+  std::vector<std::wstring> paths;
+  if (!runtime->options.baseitems_path.empty()) {
+    paths.push_back(FullPath(runtime->options.baseitems_path));
+  } else {
+    const std::wstring env_path = GetEnvironmentString(L"HG_BRIDGE_BASEITEMS_PATH");
+    if (!env_path.empty()) {
+      paths.push_back(FullPath(env_path));
+    }
   }
-  if (path.empty()) {
-    path = FindDefaultBaseitemsPath();
+  if (paths.empty()) {
+    paths = FindDefaultBaseitemsPaths();
   }
-  if (path.empty()) {
+  if (paths.empty()) {
     if (runtime->options.rewrite_live_object_item_appearances) {
       LogFormat(L"baseitems.2da source not found; live item-appearance rewrite will stay inactive");
     }
     return;
   }
 
-  path = FullPath(path);
-  std::string contents;
-  const bool read_ok = LooksLikeErfContainerPath(path)
-      ? ReadErfTextResource(path, "baseitems", &contents)
-      : ReadSmallTextFile(path, &contents);
-  if (!read_ok) {
-    LogFormat(L"baseitems.2da source unreadable: path=%s", path.c_str());
-    return;
-  }
+  std::vector<int8_t> merged_model_types;
+  std::vector<std::wstring> loaded_paths;
+  std::wstring per_source;
+  for (const std::wstring& raw_path : paths) {
+    const std::wstring path = FullPath(raw_path);
+    std::vector<int8_t> source_model_types;
+    size_t source_known = 0;
+    if (!LoadBaseItemModelTypesFromPath(path, &source_model_types, &source_known)) {
+      if (explicit_path) {
+        LogFormat(
+            L"baseitems.2da parse failed or missing ModelType/AppearanceType column: path=%s",
+            path.c_str());
+        return;
+      }
+      continue;
+    }
 
-  std::vector<int8_t> model_types;
-  if (!ParseBaseItemModelTypes2da(contents, &model_types)) {
-    LogFormat(L"baseitems.2da parse failed or missing ModelType/AppearanceType column: path=%s", path.c_str());
-    return;
+    OverlayBaseItemModelTypes(&merged_model_types, source_model_types);
+    loaded_paths.push_back(path);
+    if (!per_source.empty()) {
+      per_source += L"; ";
+    }
+    per_source += path;
+    per_source += L" known=" + std::to_wstring(source_known);
+    per_source += L" max=" + std::to_wstring(
+        source_model_types.empty() ? 0 : source_model_types.size() - 1);
   }
 
   size_t known = 0;
-  for (int8_t value : model_types) {
+  for (int8_t value : merged_model_types) {
     if (value >= 0) {
       ++known;
     }
   }
-  runtime->base_item_model_types = std::move(model_types);
-  runtime->options.baseitems_path = path;
+  if (known == 0) {
+    LogFormat(
+        L"baseitems.2da sources could not be loaded; live item-appearance rewrite will stay inactive candidates=[%s]",
+        JoinBaseitemsSourcePaths(paths).c_str());
+    return;
+  }
+
+  runtime->base_item_model_types = std::move(merged_model_types);
+  runtime->options.baseitems_path = JoinBaseitemsSourcePaths(loaded_paths);
+  const int row0_model = GetModelTypeForLog(runtime->base_item_model_types, 0);
+  const int row314_model = GetModelTypeForLog(runtime->base_item_model_types, 314);
   LogFormat(
-      L"baseitems.2da model types loaded: known=%zu max_base_item=%zu path=%s",
+      L"baseitems.2da model types loaded: known=%zu max_base_item=%zu row0_model=%d row314_model=%d sources=%zu paths=[%s] per_source=[%s]",
       known,
       runtime->base_item_model_types.empty() ? 0 : runtime->base_item_model_types.size() - 1,
-      path.c_str());
+      row0_model,
+      row314_model,
+      loaded_paths.size(),
+      runtime->options.baseitems_path.c_str(),
+      per_source.empty() ? L"<none>" : per_source.c_str());
+  if (row0_model < 0) {
+    LogFormat(
+        L"baseitems.2da warning: row 0 has no ModelType after overlay; base table source is missing paths=[%s]",
+        runtime->options.baseitems_path.c_str());
+  }
+  if (row314_model < 0) {
+    LogFormat(
+        L"baseitems.2da warning: row 314 has no ModelType after overlay; HG/CEP overlay source may be missing paths=[%s]",
+        runtime->options.baseitems_path.c_str());
+  }
 }
 
 std::wstring FindDefaultGenericdoorsPath() {
@@ -3843,9 +4098,33 @@ const wchar_t* KnownMajorMinorName(unsigned int major, unsigned int minor) {
     case 0x0403: return L"Area_AreaLoaded";
     case 0x0501: return L"GameObjUpdate_LiveObject";
     case 0x0601: return L"Input_WalkToWaypoint";
+    case 0x0602: return L"Input_Attack";
+    case 0x0603: return L"Input_ChangeDoorState";
+    case 0x0604: return L"Input_PlayAnimation";
     case 0x0605: return L"Input_Examine";
+    case 0x0606: return L"Input_UseFeat";
+    case 0x0607: return L"Input_UseSkill";
+    case 0x0608: return L"Input_Dialog";
     case 0x0609: return L"Input_UseItem";
+    case 0x060A: return L"Input_ToggleMode";
     case 0x060B: return L"Input_UseObject";
+    case 0x060C: return L"Input_UnlockObject";
+    case 0x060D: return L"Input_Rest";
+    case 0x060E: return L"Input_LockObject";
+    case 0x060F: return L"Input_StopDragMode";
+    case 0x0610: return L"Input_MemorizeSpell";
+    case 0x0611: return L"Input_UnMemorizeSpell";
+    case 0x0612: return L"Input_CastSpell";
+    case 0x0613: return L"Input_PossessFamiliar";
+    case 0x0614: return L"Input_CancelAction";
+    case 0x0615: return L"Input_GetObjectDebugInfo";
+    case 0x0616: return L"Input_MergeItem";
+    case 0x0617: return L"Input_SplitItem";
+    case 0x0618: return L"Input_TogglePauseRequest";
+    case 0x0619: return L"Input_SetPauseRequest";
+    case 0x061A: return L"Input_AlwaysRun";
+    case 0x061B: return L"Input_AssociateCommand";
+    case 0x061C: return L"Input_TurnOnSpot";
     case 0x0A01: return L"PlayerList_All";
     case 0x0A02: return L"PlayerList_Add";
     case 0x0A03: return L"PlayerList_Delete";
@@ -5417,10 +5696,13 @@ struct LegacyGuiInventoryAddShape {
   uint32_t object_id = 0;
   uint32_t base_item_id = 0;
   int model_type = -1;
+  int wire_model_type = -1;
   size_t appearance_offset = 0;
   size_t legacy_appearance_end = 0;
   size_t active_offset = 0;
   size_t record_end = 0;
+  uint32_t synthesized_appearance_bytes = 0;
+  bool compact_appearance_expansion = false;
 };
 
 bool TryGetLegacyLiveGuiInventoryAddRecordShape(
@@ -5741,6 +6023,29 @@ bool LooksLikeLegacyLiveShortAddLocStringRecordBytes(
 bool LooksLikeLegacyLiveNamedUpdateTail9(
     const std::vector<unsigned char>& bytes,
     size_t offset);
+bool IsLegacyBareActiveItemNameByte(unsigned char ch);
+
+struct LegacyLiveNamedUpdateTail {
+  uint16_t facing = 0;
+  uint8_t state_byte = 0;
+  uint32_t scale_raw = 0;
+  float scale = 0.0f;
+  uint16_t generic_state_word = 0;
+};
+
+bool TryReadAnchoredLegacyLiveNamedUpdateTail9(
+    const std::vector<unsigned char>& bytes,
+    size_t offset,
+    LegacyLiveNamedUpdateTail* tail,
+    std::wstring* rejection_reason);
+bool TryRewriteLegacyCreatureUpdateBareSecondIdentityString(
+    std::vector<unsigned char>* bytes,
+    size_t record_offset,
+    size_t record_end,
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor,
+    size_t* advanced_bit_cursor,
+    std::wstring* detail);
 
 bool IsDoorPlaceableUpdateRecord(unsigned char opcode, unsigned char object_type) {
   return opcode == 'U' && (object_type == 9 || object_type == 10);
@@ -5754,9 +6059,25 @@ size_t DoorPlaceableUpdateNameCursor(size_t record_start, uint32_t mask) {
            : 0);
 }
 
+size_t DoorPlaceableEeUpdateNameCursor(size_t record_start, uint32_t mask) {
+  constexpr size_t kUpdateHeaderBytes = 10;
+  return record_start + kUpdateHeaderBytes +
+      ((mask & kLegacyLiveObjectUpdatePositionMask) != 0
+           ? kLegacyLiveObjectUpdatePositionReadBytes
+           : 0) +
+      ((mask & kLegacyLiveObjectUpdateOrientationMask) != 0
+           ? kEeLiveObjectUpdateOrientationScalarReadBytes
+           : 0) +
+      ((mask & kLegacyLiveObjectUpdateScaleStateMask) != 0
+           ? kEeLiveObjectUpdateScaleStateReadBytes
+           : 0);
+}
+
 bool IsEeShapedDoorPlaceableUpdateMask(uint32_t mask) {
   constexpr uint32_t kEeObjectUpdateReadBits =
       kLegacyLiveObjectUpdatePositionMask |
+      kLegacyLiveObjectUpdateOrientationMask |
+      kLegacyLiveObjectUpdateScaleStateMask |
       kLegacyLiveObjectUpdateStateMask |
       kLegacyLiveObjectUpdateNameMask;
   return (mask & ~kEeObjectUpdateReadBits) == 0;
@@ -5812,14 +6133,16 @@ size_t MinimumLegacyLiveObjectRecordLengthAt(
   if (opcode == 'U' && (marker == 9 || marker == 10) && bytes.size() - offset >= 10) {
     uint32_t raw_mask = 0;
     if (TryReadU32LeFromBytes(bytes, offset + 6, &raw_mask)) {
-      size_t cursor = DoorPlaceableUpdateNameCursor(offset, raw_mask);
+      const bool already_translated_object_update =
+          IsEeShapedDoorPlaceableUpdateMask(raw_mask);
+      size_t cursor = already_translated_object_update
+          ? DoorPlaceableEeUpdateNameCursor(offset, raw_mask)
+          : DoorPlaceableUpdateNameCursor(offset, raw_mask);
       if (cursor > bytes.size()) {
         return bytes.size() - offset;
       }
       if ((raw_mask & kLegacyLiveObjectUpdateNameMask) != 0) {
         size_t inline_end = 0;
-        const bool already_translated_object_update =
-            IsEeShapedDoorPlaceableUpdateMask(raw_mask);
         if (already_translated_object_update &&
             LooksLikeInlineCExoStringAt(bytes, cursor, nullptr, &inline_end, nullptr)) {
           return inline_end - offset;
@@ -5834,7 +6157,11 @@ size_t MinimumLegacyLiveObjectRecordLengthAt(
             LooksLikeLegacyLiveObjectSubMessageBoundaryBytes(bytes, cursor + 4)) {
           return cursor + 4 - offset;
         }
-        if (LooksLikeLegacyLiveNamedUpdateTail9(bytes, cursor)) {
+        if (TryReadAnchoredLegacyLiveNamedUpdateTail9(
+                bytes,
+                cursor,
+                nullptr,
+                nullptr)) {
           const size_t legacy_name_offset = cursor + 9;
           if (LooksLikeInlineCExoStringAt(
                   bytes,
@@ -5875,6 +6202,67 @@ size_t MinimumLegacyLiveObjectRecordLengthAt(
     return 3;
   }
   return 2;
+}
+
+bool LooksLikeIncompleteLegacyLiveObjectSubMessagePrefixTail(
+    const std::vector<unsigned char>& bytes,
+    size_t* prefix_offset) {
+  if (prefix_offset != nullptr) {
+    *prefix_offset = bytes.size();
+  }
+  if (bytes.size() < 2) {
+    return false;
+  }
+
+  const size_t scan_begin = bytes.size() > 9 ? bytes.size() - 9 : 0;
+  for (size_t offset = scan_begin; offset + 1 < bytes.size(); ++offset) {
+    const size_t tail_length = bytes.size() - offset;
+    const unsigned char opcode = bytes[offset];
+    const unsigned char marker = bytes[offset + 1];
+    const bool typed_marker =
+        marker == 0x05 || marker == 0x06 || marker == 0x07 ||
+        marker == 0x09 || marker == 0x0A;
+
+    if ((opcode == 'A' || opcode == 'D' || opcode == 'U' || opcode == 'P') &&
+        typed_marker) {
+      if (tail_length < 6) {
+        if (prefix_offset != nullptr) {
+          *prefix_offset = offset;
+        }
+        return true;
+      }
+      uint32_t object_id = 0;
+      if (!TryReadU32LeFromBytes(bytes, offset + 2, &object_id) ||
+          !LooksLikeLegacyLiveObjectIdValue(object_id)) {
+        continue;
+      }
+      const size_t minimum_length =
+          MinimumLegacyLiveObjectRecordLengthAt(bytes, offset);
+      if (tail_length < minimum_length) {
+        if (prefix_offset != nullptr) {
+          *prefix_offset = offset;
+        }
+        return true;
+      }
+    }
+
+    if (opcode == 'I' &&
+        (marker == 0x05 || marker == 0xC5 || marker == 0xFD) &&
+        tail_length < 7) {
+      if (prefix_offset != nullptr) {
+        *prefix_offset = offset;
+      }
+      return true;
+    }
+
+    if (opcode == 'W' && marker <= 0x0F && tail_length < 3) {
+      if (prefix_offset != nullptr) {
+        *prefix_offset = offset;
+      }
+      return true;
+    }
+  }
+  return false;
 }
 
 bool LooksLikeInlineCExoStringAt(
@@ -6225,6 +6613,184 @@ std::wstring FormatLegacyLiveRecordDiagnosticSuffix(
   return suffix;
 }
 
+bool TryFormatLegacyLiveInventory0100OpcodeStreamAt(
+    const std::vector<unsigned char>& bytes,
+    size_t cursor,
+    size_t record_end,
+    std::wstring* formatted) {
+  if (formatted != nullptr) {
+    formatted->clear();
+  }
+  if (cursor >= record_end || record_end > bytes.size()) {
+    return false;
+  }
+
+  const uint8_t entry_count = bytes[cursor++];
+  std::wstring entries;
+  const auto append_prefix = [&]() {
+    if (!entries.empty()) {
+      entries += L"; ";
+    }
+  };
+  const auto append_u16_pair = [&](const wchar_t* opcode_name,
+                                   uint16_t first,
+                                   uint16_t second) {
+    wchar_t text[128]{};
+    swprintf_s(
+        text,
+        L"%s type=0x%04X/%u sub=0x%04X/%u",
+        opcode_name,
+        static_cast<unsigned int>(first),
+        static_cast<unsigned int>(first),
+        static_cast<unsigned int>(second),
+        static_cast<unsigned int>(second));
+    entries += text;
+  };
+  const auto read_u16 = [&](uint16_t* value) -> bool {
+    if (cursor > record_end || record_end - cursor < 2) {
+      return false;
+    }
+    if (value != nullptr) {
+      *value = ReadU16Le(bytes.data() + cursor);
+    }
+    cursor += 2;
+    return true;
+  };
+  const auto read_u32 = [&](uint32_t* value) -> bool {
+    if (cursor > record_end || record_end - cursor < 4) {
+      return false;
+    }
+    if (value != nullptr) {
+      *value = ReadU32Le(bytes.data() + cursor);
+    }
+    cursor += 4;
+    return true;
+  };
+  const auto read_float = [&](float* value) -> bool {
+    if (cursor > record_end || record_end - cursor < 4) {
+      return false;
+    }
+    if (value != nullptr) {
+      *value = 0.0f;
+      if (!TryReadFloatLeFromBytes(bytes, cursor, value)) {
+        return false;
+      }
+    }
+    cursor += 4;
+    return true;
+  };
+
+  for (uint8_t entry = 0; entry < entry_count; ++entry) {
+    if (cursor >= record_end) {
+      return false;
+    }
+    const unsigned char opcode = bytes[cursor++];
+    const wchar_t printable =
+        opcode >= 0x20 && opcode <= 0x7E ? static_cast<wchar_t>(opcode) : L'.';
+    append_prefix();
+    if (opcode == 'D') {
+      uint16_t first = 0;
+      uint16_t second = 0;
+      if (!read_u16(&first) || !read_u16(&second)) {
+        return false;
+      }
+      append_u16_pair(L"D", first, second);
+    } else if (opcode == 'S' || opcode == 'U') {
+      uint16_t first = 0;
+      uint16_t second = 0;
+      uint32_t object_id = 0;
+      if (!read_u16(&first) || !read_u16(&second) || !read_u32(&object_id)) {
+        return false;
+      }
+      append_u16_pair(opcode == 'S' ? L"S" : L"U", first, second);
+      wchar_t object_text[80]{};
+      swprintf_s(object_text, L" target=0x%08X", object_id);
+      entries += object_text;
+    } else if (opcode == 'A') {
+      uint16_t item_type = 0;
+      uint16_t subtype = 0;
+      if (!read_u16(&item_type) || !read_u16(&subtype)) {
+        return false;
+      }
+      append_u16_pair(L"A", item_type, subtype);
+      if (item_type != 0 && item_type != 2) {
+        uint32_t object_id = 0;
+        if (!read_u32(&object_id)) {
+          return false;
+        }
+        wchar_t object_text[80]{};
+        swprintf_s(object_text, L" target=0x%08X", object_id);
+        entries += object_text;
+      }
+      if (item_type == 0 || item_type == 2 || item_type == 4 ||
+          item_type == 12 || item_type == 19) {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        if (!read_float(&x) || !read_float(&y) || !read_float(&z)) {
+          return false;
+        }
+        wchar_t vector_text[128]{};
+        swprintf_s(
+            vector_text,
+            L" pos=(%.2f,%.2f,%.2f)",
+            static_cast<double>(x),
+            static_cast<double>(y),
+            static_cast<double>(z));
+        entries += vector_text;
+      }
+      if (item_type == 4 || item_type == 19) {
+        uint32_t extra = 0;
+        if (!read_u32(&extra)) {
+          return false;
+        }
+        wchar_t extra_text[64]{};
+        swprintf_s(extra_text, L" extra=0x%08X", extra);
+        entries += extra_text;
+      }
+    } else {
+      wchar_t text[48]{};
+      swprintf_s(text, L"%c/0x%02X", printable, static_cast<unsigned int>(opcode));
+      entries += text;
+    }
+  }
+
+  if (cursor != record_end) {
+    return false;
+  }
+  if (formatted != nullptr) {
+    wchar_t header[64]{};
+    swprintf_s(header, L"action0100{count=%u entries=[", entry_count);
+    *formatted = header;
+    *formatted += entries;
+    *formatted += L"]}";
+  }
+  return true;
+}
+
+std::wstring FormatLegacyLiveInventory0100OpcodeStream(
+    const std::vector<unsigned char>& bytes,
+    size_t record_offset,
+    size_t record_end,
+    uint16_t mask) {
+  if ((mask & ~0x0100u) != 0 ||
+      (mask & 0x0100u) == 0 ||
+      record_offset > bytes.size() ||
+      record_end > bytes.size() ||
+      record_end - record_offset < 8) {
+    return L"";
+  }
+  std::wstring formatted;
+  if (!TryFormatLegacyLiveInventory0100OpcodeStreamAt(
+          bytes,
+          record_offset + 7,
+          record_end,
+          &formatted)) {
+    return L"";
+  }
+  return formatted;
+}
+
 std::wstring FormatLiveObjectOpcode(bool known, unsigned char opcode) {
   if (!known) {
     return L"opcode=<none>";
@@ -6282,6 +6848,8 @@ struct LegacyLiveInventory2A00Shape {
   size_t feature25_bit_offset = 0;
   size_t total_bit_count = 0;
   bool inventory0800_true_tail = false;
+  bool inventory0200_byte_mask_branch = false;
+  uint8_t inventory0200_byte_mask_count = 0;
 };
 
 bool TryParseLegacyLiveInventoryFeature25ShapeAt(
@@ -6453,51 +7021,72 @@ bool TryParseLegacyLiveInventory2A00Shape(
     return false;
   }
 
-  size_t cursor = record_offset + 7;
-  if (record_end - cursor < 4) {
-    return false;
-  }
-  uint32_t inventory0200_count = 0;
-  if (!TryReadU32LeFromBytes(bytes, cursor, &inventory0200_count) ||
-      inventory0200_count != 0) {
-    // The nonzero 0x0200 branches have different per-entry fragment BOOL
-    // shapes. Keep them evidence-driven instead of guessing the bit cursor.
-    return false;
-  }
-  cursor += 4;
+  const size_t branch_cursor = record_offset + 7;
+  auto try_parse_after_0200 =
+      [&](size_t cursor,
+          bool byte_mask_branch,
+          uint8_t byte_mask_count) -> bool {
+        LegacyLiveInventoryFeature25Shape feature25;
+        if (!TryParseLegacyLiveInventoryFeature25ShapeAt(
+                bytes,
+                cursor,
+                record_end,
+                &feature25) ||
+            feature25.missing_second_count ||
+            feature25.block_end > record_end) {
+          return false;
+        }
 
-  LegacyLiveInventoryFeature25Shape feature25;
-  if (!TryParseLegacyLiveInventoryFeature25ShapeAt(
-          bytes,
-          cursor,
-          record_end,
-          &feature25) ||
-      feature25.missing_second_count ||
-      feature25.block_end > record_end) {
-    return false;
+        bool inventory0800_true_tail = false;
+        if (feature25.block_end == record_end) {
+          inventory0800_true_tail = false;
+        } else if (record_end - feature25.block_end == 12) {
+          inventory0800_true_tail = true;
+        } else {
+          return false;
+        }
+
+        LegacyLiveInventory2A00Shape local;
+        local.feature25 = feature25;
+        local.feature25_bit_offset = 2;
+        local.total_bit_count =
+            local.feature25_bit_offset +
+            static_cast<size_t>(feature25.second_count) * 3u +
+            1u;
+        local.inventory0800_true_tail = inventory0800_true_tail;
+        local.inventory0200_byte_mask_branch = byte_mask_branch;
+        local.inventory0200_byte_mask_count = byte_mask_count;
+        if (shape != nullptr) {
+          *shape = local;
+        }
+        return true;
+      };
+
+  if (record_end - branch_cursor >= 4) {
+    uint32_t inventory0200_count = 0;
+    if (TryReadU32LeFromBytes(bytes, branch_cursor, &inventory0200_count) &&
+        inventory0200_count == 0 &&
+        try_parse_after_0200(branch_cursor + 4, false, 0)) {
+      return true;
+    }
   }
 
-  bool inventory0800_true_tail = false;
-  if (feature25.block_end == record_end) {
-    inventory0800_true_tail = false;
-  } else if (record_end - feature25.block_end == 12) {
-    inventory0800_true_tail = true;
-  } else {
-    return false;
+  if (branch_cursor < record_end) {
+    constexpr uint8_t kMaxReasonableInventory0200ByteMasks = 64;
+    const uint8_t byte_mask_count = bytes[branch_cursor];
+    const size_t masks_offset = branch_cursor + 1;
+    if (byte_mask_count <= kMaxReasonableInventory0200ByteMasks &&
+        masks_offset <= record_end &&
+        static_cast<size_t>(byte_mask_count) <= record_end - masks_offset &&
+        try_parse_after_0200(
+            masks_offset + static_cast<size_t>(byte_mask_count),
+            true,
+            byte_mask_count)) {
+      return true;
+    }
   }
 
-  LegacyLiveInventory2A00Shape local;
-  local.feature25 = feature25;
-  local.feature25_bit_offset = 2;
-  local.total_bit_count =
-      local.feature25_bit_offset +
-      static_cast<size_t>(feature25.second_count) * 3u +
-      1u;
-  local.inventory0800_true_tail = inventory0800_true_tail;
-  if (shape != nullptr) {
-    *shape = local;
-  }
-  return true;
+  return false;
 }
 
 bool TryGetLegacyLiveInventoryFragmentBitCount(
@@ -6609,8 +7198,344 @@ bool TryGetLegacyLiveInventoryFragmentBitCount(
       0x0001u | 0x0002u | kLegacyLiveInventoryLegacyIconListMask |
       0x0008u | kLegacyLiveInventorySimpleCategoryMask |
       kLegacyLiveInventoryRichCategoryMask | 0x0040u | 0x0080u |
-      0x0100u | 0x0400u | 0x1000u | 0x2000u | 0x4000u |
-      0x8000u;
+      0x0100u | 0x0200u | 0x0400u | 0x0800u | 0x1000u |
+      0x2000u | 0x4000u | 0x8000u;
+
+  if ((mask & ~kLegacyLiveInventoryGenericParseMask) == 0 &&
+      (mask & (0x0200u | 0x0800u)) != 0) {
+    struct GenericInventoryCandidate {
+      size_t cursor = 0;
+      size_t bits = 0;
+    };
+
+    std::vector<GenericInventoryCandidate> candidates;
+    candidates.push_back(GenericInventoryCandidate{record_offset + 7, 0});
+
+    auto replace_candidates =
+        [&](std::vector<GenericInventoryCandidate>&& next) -> bool {
+          candidates = std::move(next);
+          return !candidates.empty();
+        };
+    auto advance_candidates =
+        [&](size_t bytes_to_advance, size_t bits_to_add = 0) -> bool {
+          std::vector<GenericInventoryCandidate> next;
+          next.reserve(candidates.size());
+          for (GenericInventoryCandidate candidate : candidates) {
+            if (candidate.cursor <= record_end &&
+                bytes_to_advance <= record_end - candidate.cursor) {
+              candidate.cursor += bytes_to_advance;
+              candidate.bits += bits_to_add;
+              next.push_back(candidate);
+            }
+          }
+          return replace_candidates(std::move(next));
+        };
+
+    auto apply_ten_bit_groups = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size());
+      for (GenericInventoryCandidate candidate : candidates) {
+        size_t group_end = 0;
+        if (TryAdvanceLegacyLiveInventoryTenBitValueGroups(
+                bytes,
+                candidate.cursor,
+                record_end,
+                &group_end,
+                nullptr,
+                nullptr)) {
+          candidate.cursor = group_end;
+          next.push_back(candidate);
+        }
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    auto apply_simple_categories = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size());
+      for (GenericInventoryCandidate candidate : candidates) {
+        size_t simple_end = 0;
+        if (TryAdvanceLegacyLiveInventorySimpleCategoryBlock(
+                bytes,
+                candidate.cursor,
+                record_end,
+                kLegacyLiveInventoryCategoryCount,
+                &simple_end,
+                nullptr,
+                nullptr)) {
+          candidate.cursor = simple_end;
+          next.push_back(candidate);
+        }
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    auto apply_rich_categories = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size());
+      for (GenericInventoryCandidate candidate : candidates) {
+        size_t rich_end = 0;
+        uint32_t first_entries = 0;
+        uint32_t second_entries = 0;
+        if (TryAdvanceLegacyLiveInventoryCategoryBlock(
+                bytes,
+                candidate.cursor,
+                record_end,
+                kLegacyLiveInventoryCategoryCount,
+                &rich_end,
+                &first_entries,
+                &second_entries)) {
+          candidate.cursor = rich_end;
+          candidate.bits += static_cast<size_t>(second_entries) * 2u;
+          next.push_back(candidate);
+        }
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    auto apply_0400 = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size());
+      for (GenericInventoryCandidate candidate : candidates) {
+        size_t cursor = candidate.cursor;
+        if (cursor >= record_end) {
+          continue;
+        }
+        const uint8_t first_count = bytes[cursor++];
+        if (first_count > record_end - cursor) {
+          continue;
+        }
+        cursor += first_count;
+        if (cursor >= record_end) {
+          continue;
+        }
+        const uint8_t second_count = bytes[cursor++];
+        if (second_count > record_end - cursor) {
+          continue;
+        }
+        cursor += second_count;
+        candidate.cursor = cursor;
+        candidate.bits += second_count;
+        next.push_back(candidate);
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    auto apply_legacy_icon_list = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size());
+      for (GenericInventoryCandidate candidate : candidates) {
+        size_t legacy_icon_end = 0;
+        uint32_t legacy_icon_bits = 0;
+        if (TryAdvanceLegacyLiveInventoryLegacyIconListBlock(
+                bytes,
+                candidate.cursor,
+                record_end,
+                &legacy_icon_end,
+                nullptr,
+                nullptr,
+                &legacy_icon_bits)) {
+          candidate.cursor = legacy_icon_end;
+          candidate.bits += legacy_icon_bits;
+          next.push_back(candidate);
+        }
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    auto apply_0200 = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size() * 2);
+      constexpr uint8_t kMaxReasonableInventory0200ByteMasks = 64;
+      for (GenericInventoryCandidate candidate : candidates) {
+        if (candidate.cursor <= record_end &&
+            record_end - candidate.cursor >= 4) {
+          GenericInventoryCandidate dword_path = candidate;
+          dword_path.cursor += 4;
+          dword_path.bits += 2;
+          next.push_back(dword_path);
+        }
+        if (candidate.cursor < record_end) {
+          const uint8_t byte_mask_count = bytes[candidate.cursor];
+          const size_t masks_offset = candidate.cursor + 1;
+          if (byte_mask_count <= kMaxReasonableInventory0200ByteMasks &&
+              masks_offset <= record_end &&
+              static_cast<size_t>(byte_mask_count) <= record_end - masks_offset) {
+            GenericInventoryCandidate byte_mask_path = candidate;
+            byte_mask_path.cursor =
+                masks_offset + static_cast<size_t>(byte_mask_count);
+            byte_mask_path.bits += 2;
+            next.push_back(byte_mask_path);
+          }
+        }
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    auto apply_0100 = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size());
+      for (GenericInventoryCandidate candidate : candidates) {
+        size_t cursor = candidate.cursor;
+        if (cursor >= record_end) {
+          continue;
+        }
+        const uint8_t entry_count = bytes[cursor++];
+        bool ok = true;
+        for (uint8_t entry = 0; ok && entry < entry_count; ++entry) {
+          if (cursor >= record_end) {
+            ok = false;
+            break;
+          }
+          const uint8_t opcode = bytes[cursor++];
+          if (opcode == 'D') {
+            ok = cursor <= record_end && 4 <= record_end - cursor;
+            cursor += ok ? 4 : 0;
+          } else if (opcode == 'S' || opcode == 'U') {
+            ok = cursor <= record_end && 8 <= record_end - cursor;
+            cursor += ok ? 8 : 0;
+          } else if (opcode == 'A') {
+            if (cursor > record_end || record_end - cursor < 4) {
+              ok = false;
+              break;
+            }
+            const uint16_t item_type = ReadU16Le(bytes.data() + cursor);
+            cursor += 4;
+            if (item_type != 0 && item_type != 2) {
+              ok = cursor <= record_end && 4 <= record_end - cursor;
+              cursor += ok ? 4 : 0;
+            }
+            if (ok &&
+                (item_type == 0 || item_type == 2 || item_type == 4 ||
+                 item_type == 12 || item_type == 19)) {
+              ok = cursor <= record_end && 12 <= record_end - cursor;
+              cursor += ok ? 12 : 0;
+            }
+            if (ok && (item_type == 4 || item_type == 19)) {
+              ok = cursor <= record_end && 4 <= record_end - cursor;
+              cursor += ok ? 4 : 0;
+            }
+          }
+        }
+        if (ok) {
+          candidate.cursor = cursor;
+          next.push_back(candidate);
+        }
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    auto apply_2000 = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size());
+      for (GenericInventoryCandidate candidate : candidates) {
+        LegacyLiveInventoryFeature25Shape feature25;
+        if (TryParseLegacyLiveInventoryFeature25ShapeAt(
+                bytes,
+                candidate.cursor,
+                record_end,
+                &feature25) &&
+            !feature25.missing_second_count &&
+            feature25.block_end <= record_end) {
+          candidate.cursor = feature25.block_end;
+          candidate.bits += static_cast<size_t>(feature25.second_count) * 3u;
+          next.push_back(candidate);
+        }
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    auto apply_0800 = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size() * 2);
+      for (GenericInventoryCandidate candidate : candidates) {
+        GenericInventoryCandidate false_path = candidate;
+        false_path.bits += 1;
+        next.push_back(false_path);
+        if (candidate.cursor <= record_end &&
+            12 <= record_end - candidate.cursor) {
+          GenericInventoryCandidate true_path = candidate;
+          true_path.cursor += 12;
+          true_path.bits += 1;
+          next.push_back(true_path);
+        }
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    auto apply_4000 = [&]() -> bool {
+      std::vector<GenericInventoryCandidate> next;
+      next.reserve(candidates.size());
+      for (GenericInventoryCandidate candidate : candidates) {
+        size_t cursor = candidate.cursor;
+        if (cursor > record_end || record_end - cursor < 2) {
+          continue;
+        }
+        const uint16_t entry_count = ReadU16Le(bytes.data() + cursor);
+        cursor += 2;
+        if (entry_count > kMaxReasonableLiveInventoryCategoryEntries) {
+          continue;
+        }
+        bool ok = true;
+        size_t bits = candidate.bits;
+        for (uint16_t entry = 0; ok && entry < entry_count; ++entry) {
+          if (cursor >= record_end) {
+            ok = false;
+            break;
+          }
+          const uint8_t opcode = bytes[cursor++];
+          if (opcode == 'S') {
+            ok = cursor <= record_end && 2 <= record_end - cursor;
+            cursor += ok ? 2 : 0;
+          } else if (opcode == 'U') {
+            ok = cursor <= record_end && 5 <= record_end - cursor;
+            if (ok) {
+              cursor += 5;
+              bits += 1;
+            }
+          }
+        }
+        if (ok) {
+          candidate.cursor = cursor;
+          candidate.bits = bits;
+          next.push_back(candidate);
+        }
+      }
+      return replace_candidates(std::move(next));
+    };
+
+    bool ok = true;
+    if (ok && (mask & 0x0001u) != 0) ok = advance_candidates(2 + 4 + 4, 1);
+    if (ok && (mask & 0x0002u) != 0) ok = advance_candidates(4);
+    if (ok && (mask & 0x0008u) != 0) ok = advance_candidates(4);
+    if (ok && (mask & 0x8000u) != 0) ok = advance_candidates(12);
+    if (ok && (mask & 0x0080u) != 0) ok = apply_ten_bit_groups();
+    if (ok && (mask & kLegacyLiveInventorySimpleCategoryMask) != 0) ok = apply_simple_categories();
+    if (ok && (mask & kLegacyLiveInventoryRichCategoryMask) != 0) ok = apply_rich_categories();
+    if (ok && (mask & 0x0040u) != 0) ok = apply_ten_bit_groups();
+    if (ok && (mask & 0x0400u) != 0) ok = apply_0400();
+    if (ok && (mask & kLegacyLiveInventoryLegacyIconListMask) != 0) ok = apply_legacy_icon_list();
+    if (ok && (mask & 0x0200u) != 0) ok = apply_0200();
+    if (ok && (mask & 0x0100u) != 0) ok = apply_0100();
+    if (ok && (mask & 0x2000u) != 0) ok = apply_2000();
+    if (ok && (mask & 0x0800u) != 0) ok = apply_0800();
+    if (ok && (mask & 0x1000u) != 0) {
+      // 0x1000 clears local UI state and consumes no network fields.
+    }
+    if (ok && (mask & 0x4000u) != 0) ok = apply_4000();
+
+    if (ok) {
+      for (const GenericInventoryCandidate& candidate : candidates) {
+        if (candidate.cursor == record_end) {
+          if (bit_count != nullptr) {
+            *bit_count = candidate.bits;
+          }
+          return true;
+        }
+      }
+    }
+    return false;
+  }
 
   if ((mask & ~kLegacyLiveInventoryGenericParseMask) == 0 &&
       (mask & (0x0200u | 0x0800u)) == 0) {
@@ -7084,6 +8009,12 @@ bool TryFormatLegacyLiveObjectPacketSummary(
             fragment_bits_known ? L"" : L"?",
             fragment_bits);
         entries += entry;
+        const std::wstring action0100 =
+            FormatLegacyLiveInventory0100OpcodeStream(bytes, offset, record_end, mask);
+        if (!action0100.empty()) {
+          entries += L" ";
+          entries += action0100;
+        }
         entries += FormatLegacyLiveRecordDiagnosticSuffix(bytes, offset, record_end);
         ++logged_entry_count;
       }
@@ -7246,6 +8177,363 @@ bool TryFormatLegacyLiveObjectPacketSummary(
   return true;
 }
 
+LiveObjectLifecycleEntry* FindLiveObjectLifecycleEntry(
+    BridgeRuntime* runtime,
+    unsigned char object_type,
+    uint32_t object_id) {
+  if (runtime == nullptr) {
+    return nullptr;
+  }
+  for (LiveObjectLifecycleEntry& entry : runtime->latest_live_object_lifecycle_rows) {
+    if (entry.object_type == object_type && entry.object_id == object_id) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+bool TryExtractLiveObjectRecordNamePreviewForLifecycle(
+    const std::vector<unsigned char>& bytes,
+    size_t record_offset,
+    size_t record_end,
+    unsigned char opcode,
+    unsigned char object_type,
+    std::string* name_preview) {
+  if (name_preview != nullptr) {
+    name_preview->clear();
+  }
+  if (opcode != 'A' ||
+      record_offset > bytes.size() ||
+      record_end > bytes.size() ||
+      record_end <= record_offset ||
+      record_end - record_offset < 10) {
+    return false;
+  }
+
+  uint32_t first_dword = 0;
+  const bool first_known =
+      record_offset + 10 <= bytes.size() &&
+      TryReadU32LeFromBytes(bytes, record_offset + 6, &first_dword);
+  size_t name_offset_from_object = 0;
+  if (object_type == 10 && first_known) {
+    name_offset_from_object = first_dword == 0 ? 12 : 8;
+  } else if (object_type == 9 || object_type == 5) {
+    name_offset_from_object = 4;
+  } else {
+    return false;
+  }
+
+  const size_t name_start = record_offset + 2 + name_offset_from_object;
+  if (name_start >= record_end || name_start >= bytes.size()) {
+    return false;
+  }
+
+  uint32_t inline_name_length = 0;
+  size_t inline_name_end = 0;
+  std::string inline_name;
+  if (LooksLikeInlineCExoStringAt(
+          bytes,
+          name_start,
+          &inline_name_length,
+          &inline_name_end,
+          &inline_name) &&
+      inline_name_end <= record_end) {
+    if (name_preview != nullptr) {
+      *name_preview = inline_name;
+    }
+    return true;
+  }
+
+  uint32_t strref = 0;
+  if ((object_type == 9 || object_type == 10) &&
+      LooksLikeLegacyLiveShortAddLocStringRecordBytes(
+          bytes,
+          object_type,
+          name_start,
+          nullptr) &&
+      TryReadU32LeFromBytes(bytes, name_start, &strref)) {
+    if (name_preview != nullptr) {
+      *name_preview = "strref:" + std::to_string(strref);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+void ObserveLiveObjectLifecycle(
+    BridgeRuntime* runtime,
+    const wchar_t* direction,
+    const unsigned char* packet,
+    size_t packet_size) {
+  if (runtime == nullptr ||
+      packet == nullptr ||
+      packet_size <= 7 ||
+      !IsHighLevelGameplayEnvelope(packet[0]) ||
+      packet[1] != 5 ||
+      packet[2] != 1 ||
+      packet_size > kMaxReasonableReassembledGameplayPayload) {
+    return;
+  }
+
+  const uint32_t wire_declared = ReadU32Le(packet + 3);
+  size_t live_end = packet_size;
+  if (wire_declared != 0) {
+    if (wire_declared < 7 ||
+        wire_declared > packet_size ||
+        wire_declared > kMaxReasonableReassembledGameplayPayload) {
+      return;
+    }
+    live_end = wire_declared;
+  }
+  std::vector<unsigned char> bytes(packet + 7, packet + live_end);
+  if (bytes.size() < 6) {
+    return;
+  }
+
+  ++runtime->live_object_lifecycle_observed_count;
+  uint32_t records = 0;
+  uint32_t add_records = 0;
+  uint32_t update_records = 0;
+  uint32_t property_records = 0;
+  uint32_t delete_records = 0;
+  uint32_t duplicate_adds = 0;
+  uint32_t update_before_add = 0;
+  uint32_t delete_before_add = 0;
+  uint32_t untracked_overflow = 0;
+  std::wstring details;
+  constexpr size_t kMaxLifecycleRows = 4096;
+  constexpr size_t kMaxDetails = 3800;
+
+  auto append_detail = [&](const wchar_t* format,
+                           unsigned char opcode,
+                           unsigned char object_type,
+                           uint32_t object_id,
+                           size_t offset,
+                           const LiveObjectLifecycleEntry* previous,
+                           const std::string& name) {
+    if (details.size() > kMaxDetails) {
+      return;
+    }
+    const wchar_t printable_opcode =
+        opcode >= 0x20 && opcode <= 0x7E ? static_cast<wchar_t>(opcode) : L'.';
+    wchar_t text[768]{};
+    swprintf_s(
+        text,
+        format,
+        details.empty() ? L"" : L"; ",
+        printable_opcode,
+        static_cast<unsigned int>(object_type),
+        LegacyLiveObjectTypeName(object_type),
+        object_id,
+        offset,
+        previous != nullptr ? previous->add_count : 0u,
+        previous != nullptr ? previous->update_count : 0u,
+        previous != nullptr ? previous->property_count : 0u,
+        previous != nullptr ? previous->delete_count : 0u,
+        previous != nullptr && previous->active ? 1 : 0,
+        previous != nullptr && !previous->latest_name.empty()
+            ? AsciiPreviewToWide(previous->latest_name, 64).c_str()
+            : L"",
+        name.empty() ? L"" : AsciiPreviewToWide(name, 64).c_str());
+    details += text;
+  };
+
+  for (size_t offset = 0; offset + 1 < bytes.size();) {
+    if (!LooksLikeLegacyLiveObjectSubMessageBoundaryBytes(bytes, offset)) {
+      ++offset;
+      continue;
+    }
+
+    size_t record_end = FindNextLegacyLiveObjectSubMessageBoundaryAfter(bytes, offset);
+    if (record_end > bytes.size()) {
+      record_end = bytes.size();
+    }
+    const unsigned char opcode = bytes[offset];
+    if (opcode != 'A' && opcode != 'U' && opcode != 'P' && opcode != 'D') {
+      offset = record_end > offset ? record_end : offset + 1;
+      continue;
+    }
+    if (offset + 6 > bytes.size() ||
+        !LooksLikeLegacyLiveObjectIdAt(bytes, offset + 2)) {
+      offset = record_end > offset ? record_end : offset + 1;
+      continue;
+    }
+
+    ++records;
+    const unsigned char object_type = bytes[offset + 1];
+    uint32_t object_id = 0;
+    TryReadU32LeFromBytes(bytes, offset + 2, &object_id);
+    std::string name;
+    (void)TryExtractLiveObjectRecordNamePreviewForLifecycle(
+        bytes,
+        offset,
+        record_end,
+        opcode,
+        object_type,
+        &name);
+
+    LiveObjectLifecycleEntry* entry =
+        FindLiveObjectLifecycleEntry(runtime, object_type, object_id);
+    const bool have_entry = entry != nullptr;
+    const LiveObjectLifecycleEntry previous =
+        have_entry ? *entry : LiveObjectLifecycleEntry{};
+
+    if (opcode == 'A') {
+      ++add_records;
+      if (entry != nullptr && entry->active) {
+        ++duplicate_adds;
+        append_detail(
+            L"%sduplicate-add %c type=%u/%s id=0x%08X off=%zu prev[add=%u update=%u prop=%u del=%u active=%d name='%s'] new_name='%s'",
+            opcode,
+            object_type,
+            object_id,
+            offset,
+            &previous,
+            name);
+      }
+      if (entry == nullptr) {
+        if (runtime->latest_live_object_lifecycle_rows.size() >= kMaxLifecycleRows) {
+          ++untracked_overflow;
+          offset = record_end > offset ? record_end : offset + 1;
+          continue;
+        }
+        LiveObjectLifecycleEntry new_entry;
+        new_entry.object_type = object_type;
+        new_entry.object_id = object_id;
+        runtime->latest_live_object_lifecycle_rows.push_back(std::move(new_entry));
+        entry = &runtime->latest_live_object_lifecycle_rows.back();
+      }
+      entry->active = true;
+      ++entry->add_count;
+      if (!name.empty()) {
+        entry->latest_name = name;
+      }
+    } else if (opcode == 'D') {
+      ++delete_records;
+      if (entry == nullptr || !entry->active) {
+        ++delete_before_add;
+        append_detail(
+            L"%sdelete-before-active %c type=%u/%s id=0x%08X off=%zu prev[add=%u update=%u prop=%u del=%u active=%d name='%s'] new_name='%s'",
+            opcode,
+            object_type,
+            object_id,
+            offset,
+            have_entry ? &previous : nullptr,
+            name);
+      }
+      if (entry == nullptr) {
+        if (runtime->latest_live_object_lifecycle_rows.size() >= kMaxLifecycleRows) {
+          ++untracked_overflow;
+          offset = record_end > offset ? record_end : offset + 1;
+          continue;
+        }
+        LiveObjectLifecycleEntry new_entry;
+        new_entry.object_type = object_type;
+        new_entry.object_id = object_id;
+        runtime->latest_live_object_lifecycle_rows.push_back(std::move(new_entry));
+        entry = &runtime->latest_live_object_lifecycle_rows.back();
+      }
+      entry->active = false;
+      ++entry->delete_count;
+    } else if (opcode == 'U') {
+      ++update_records;
+      if (entry == nullptr || !entry->active) {
+        ++update_before_add;
+        append_detail(
+            L"%supdate-before-active %c type=%u/%s id=0x%08X off=%zu prev[add=%u update=%u prop=%u del=%u active=%d name='%s'] new_name='%s'",
+            opcode,
+            object_type,
+            object_id,
+            offset,
+            have_entry ? &previous : nullptr,
+            name);
+      }
+      if (entry == nullptr) {
+        if (runtime->latest_live_object_lifecycle_rows.size() >= kMaxLifecycleRows) {
+          ++untracked_overflow;
+          offset = record_end > offset ? record_end : offset + 1;
+          continue;
+        }
+        LiveObjectLifecycleEntry new_entry;
+        new_entry.object_type = object_type;
+        new_entry.object_id = object_id;
+        runtime->latest_live_object_lifecycle_rows.push_back(std::move(new_entry));
+        entry = &runtime->latest_live_object_lifecycle_rows.back();
+      }
+      ++entry->update_count;
+    } else if (opcode == 'P') {
+      ++property_records;
+      if (entry == nullptr || !entry->active) {
+        ++update_before_add;
+        append_detail(
+            L"%sproperty-before-active %c type=%u/%s id=0x%08X off=%zu prev[add=%u update=%u prop=%u del=%u active=%d name='%s'] new_name='%s'",
+            opcode,
+            object_type,
+            object_id,
+            offset,
+            have_entry ? &previous : nullptr,
+            name);
+      }
+      if (entry == nullptr) {
+        if (runtime->latest_live_object_lifecycle_rows.size() >= kMaxLifecycleRows) {
+          ++untracked_overflow;
+          offset = record_end > offset ? record_end : offset + 1;
+          continue;
+        }
+        LiveObjectLifecycleEntry new_entry;
+        new_entry.object_type = object_type;
+        new_entry.object_id = object_id;
+        runtime->latest_live_object_lifecycle_rows.push_back(std::move(new_entry));
+        entry = &runtime->latest_live_object_lifecycle_rows.back();
+      }
+      ++entry->property_count;
+    }
+
+    if (entry != nullptr) {
+      entry->last_packet_index = runtime->live_object_lifecycle_observed_count;
+      entry->last_record_offset = offset;
+      entry->last_opcode = opcode;
+      if (!name.empty()) {
+        entry->latest_name = name;
+      }
+    }
+    offset = record_end > offset ? record_end : offset + 1;
+  }
+
+  const uint32_t suspicious =
+      duplicate_adds + update_before_add + delete_before_add + untracked_overflow;
+  if (suspicious != 0) {
+    ++runtime->live_object_lifecycle_suspicious_count;
+  }
+  if (records != 0 &&
+      (suspicious != 0 ||
+       runtime->live_object_lifecycle_observed_count <= 30 ||
+       runtime->options.packet_dump)) {
+    LogFormat(
+        L"%s live-object lifecycle diagnostic #%llu: area='%s' payload-len=%zu records=%u add=%u update=%u property=%u delete=%u active-tracked=%zu duplicate-add=%u update-before-active=%u delete-before-active=%u overflow=%u suspicious=%u total-suspicious=%llu details=[%s]",
+        direction != nullptr ? direction : L"<unknown>",
+        static_cast<unsigned long long>(runtime->live_object_lifecycle_observed_count),
+        runtime->latest_area_resref.empty()
+            ? L"<unknown>"
+            : AsciiPreviewToWide(runtime->latest_area_resref, 32).c_str(),
+        packet_size,
+        records,
+        add_records,
+        update_records,
+        property_records,
+        delete_records,
+        runtime->latest_live_object_lifecycle_rows.size(),
+        duplicate_adds,
+        update_before_add,
+        delete_before_add,
+        untracked_overflow,
+        suspicious,
+        static_cast<unsigned long long>(runtime->live_object_lifecycle_suspicious_count),
+        details.empty() ? L"<none>" : details.c_str());
+  }
+}
+
 uint32_t TranslateLegacyLiveObjectUpdateMask(
     unsigned char object_type,
     uint32_t raw_mask,
@@ -7257,10 +8545,11 @@ uint32_t TranslateLegacyLiveObjectUpdateMask(
   if (object_type == 9) {
     constexpr uint32_t kLegacyPlaceableUpdateBits =
         kLegacyLiveObjectUpdatePositionMask |  // generic position
+        kLegacyLiveObjectUpdateScaleStateMask |  // generic scale/state word
         kLegacyLiveObjectUpdateStateMask |  // placeable state/action flags
         kLegacyLiveObjectUpdateNameMask;    // placeable name payload
     if (reason != nullptr) {
-      *reason = L"placeable-position-state-name";
+      *reason = L"placeable-position-scale-state-name";
     }
     return raw_mask & kLegacyPlaceableUpdateBits;
   }
@@ -7268,10 +8557,11 @@ uint32_t TranslateLegacyLiveObjectUpdateMask(
   if (object_type == 10) {
     constexpr uint32_t kLegacyDoorUpdateBits =
         kLegacyLiveObjectUpdatePositionMask |  // generic position
+        kLegacyLiveObjectUpdateScaleStateMask |  // generic scale/state word
         kLegacyLiveObjectUpdateStateMask |  // door state/action flags
         kLegacyLiveObjectUpdateNameMask;    // door name payload
     if (reason != nullptr) {
-      *reason = L"door-position-state-name";
+      *reason = L"door-position-scale-state-name";
     }
     return raw_mask & kLegacyDoorUpdateBits;
   }
@@ -7298,19 +8588,209 @@ bool LooksLikeLegacyLiveScalarTail6(
       IsPlausibleLegacyObjectScale(scale);
 }
 
+bool TryReadLegacyLiveNamedUpdateTail9(
+    const std::vector<unsigned char>& bytes,
+    size_t offset,
+    bool require_small_state_byte,
+    LegacyLiveNamedUpdateTail* tail,
+    std::wstring* rejection_reason) {
+  if (rejection_reason != nullptr) {
+    rejection_reason->clear();
+  }
+  const auto reject = [&](const wchar_t* reason) -> bool {
+    if (rejection_reason != nullptr) {
+      *rejection_reason = reason != nullptr ? reason : L"unknown";
+    }
+    return false;
+  };
+
+  uint16_t facing = 0;
+  uint32_t scale_raw = 0;
+  float scale = 0.0f;
+  uint16_t state = 0;
+  if (offset > bytes.size()) {
+    return reject(L"offset-past-buffer");
+  }
+  if (bytes.size() - offset < 9) {
+    return reject(L"tail-too-short");
+  }
+  if (!TryReadU16LeFromBytes(bytes, offset, &facing)) {
+    return reject(L"facing-unreadable");
+  }
+  if (require_small_state_byte && bytes[offset + 2] > 10) {
+    return reject(L"state-byte-outside-small-range");
+  }
+  if (!TryReadU32LeFromBytes(bytes, offset + 3, &scale_raw) ||
+      !TryReadFloatLeFromBytes(bytes, offset + 3, &scale)) {
+    return reject(L"scale-unreadable");
+  }
+  if (!TryReadU16LeFromBytes(bytes, offset + 7, &state)) {
+    return reject(L"appearance-state-unreadable");
+  }
+  if (!IsPlausibleLegacyObjectScale(scale)) {
+    return reject(L"scale-not-plausible");
+  }
+  if (tail != nullptr) {
+    tail->facing = facing;
+    tail->state_byte = bytes[offset + 2];
+    tail->scale_raw = scale_raw;
+    tail->scale = scale;
+    tail->generic_state_word = state;
+  }
+  return true;
+}
+
+bool TryReadLegacyLiveNamedUpdateTail9(
+    const std::vector<unsigned char>& bytes,
+    size_t offset,
+    LegacyLiveNamedUpdateTail* tail) {
+  return TryReadLegacyLiveNamedUpdateTail9(
+      bytes,
+      offset,
+      true,
+      tail,
+      nullptr);
+}
+
+bool TryReadAnchoredLegacyLiveNamedUpdateTail9(
+    const std::vector<unsigned char>& bytes,
+    size_t offset,
+    LegacyLiveNamedUpdateTail* tail,
+    std::wstring* rejection_reason) {
+  return TryReadLegacyLiveNamedUpdateTail9(
+      bytes,
+      offset,
+      false,
+      tail,
+      rejection_reason);
+}
+
 bool LooksLikeLegacyLiveNamedUpdateTail9(
     const std::vector<unsigned char>& bytes,
     size_t offset) {
-  uint16_t facing = 0;
-  float scale = 0.0f;
-  uint16_t state = 0;
-  return TryReadU16LeFromBytes(bytes, offset, &facing) &&
-      offset <= bytes.size() &&
-      bytes.size() - offset >= 9 &&
-      bytes[offset + 2] <= 10 &&
-      TryReadFloatLeFromBytes(bytes, offset + 3, &scale) &&
-      TryReadU16LeFromBytes(bytes, offset + 7, &state) &&
-      IsPlausibleLegacyObjectScale(scale);
+  return TryReadLegacyLiveNamedUpdateTail9(bytes, offset, nullptr);
+}
+
+bool LegacyLiveNamedUpdateTailFollowingPayloadReady(
+    const std::vector<unsigned char>& bytes,
+    size_t tail_offset,
+    size_t record_end) {
+  if (tail_offset > record_end ||
+      record_end > bytes.size() ||
+      record_end - tail_offset < 13) {
+    return false;
+  }
+
+  const size_t name_offset = tail_offset + 9;
+  size_t inline_end = 0;
+  if (LooksLikeInlineCExoStringAt(
+          bytes,
+          name_offset,
+          nullptr,
+          &inline_end,
+          nullptr) &&
+      inline_end <= record_end &&
+      record_end - inline_end <= 4) {
+    return true;
+  }
+
+  uint32_t length = 0;
+  if (TryReadU32LeFromBytes(bytes, name_offset, &length) &&
+      length == 0 &&
+      name_offset + 4 < record_end) {
+    constexpr size_t kMaxLegacyBareUpdateNameBytes = 128;
+    const size_t text_start = name_offset + 4;
+    const size_t text_length = record_end - text_start;
+    if (text_length > 0 && text_length <= kMaxLegacyBareUpdateNameBytes) {
+      bool printable = true;
+      for (size_t cursor = text_start; cursor < record_end; ++cursor) {
+        if (!IsLegacyBareActiveItemNameByte(bytes[cursor])) {
+          printable = false;
+          break;
+        }
+      }
+      if (printable) {
+        return true;
+      }
+    }
+  }
+
+  return record_end - (name_offset + 4) <= 4;
+}
+
+std::wstring FormatLegacyLiveNamedUpdateTailProbe(
+    const std::vector<unsigned char>& bytes,
+    size_t tail_offset,
+    size_t record_end,
+    const LegacyLiveNamedUpdateTail* tail,
+    const wchar_t* status) {
+  wchar_t text[512]{};
+  const size_t available = tail_offset <= record_end && record_end <= bytes.size()
+      ? record_end - tail_offset
+      : 0;
+  const std::wstring raw = available != 0
+      ? FormatLimitedBytes(bytes.data() + tail_offset, available, 64)
+      : L"";
+  swprintf_s(
+      text,
+      L"%s@%zu facing=0x%04X/%u state=0x%02X/%u scale=%.4f state_word=0x%04X/%u raw=[%s]",
+      status != nullptr ? status : L"tail",
+      tail_offset,
+      tail != nullptr ? static_cast<unsigned int>(tail->facing) : 0u,
+      tail != nullptr ? static_cast<unsigned int>(tail->facing) : 0u,
+      tail != nullptr ? static_cast<unsigned int>(tail->state_byte) : 0u,
+      tail != nullptr ? static_cast<unsigned int>(tail->state_byte) : 0u,
+      tail != nullptr ? static_cast<double>(tail->scale) : 0.0,
+      tail != nullptr ? static_cast<unsigned int>(tail->generic_state_word) : 0u,
+      tail != nullptr ? static_cast<unsigned int>(tail->generic_state_word) : 0u,
+      raw.c_str());
+  return text;
+}
+
+uint16_t EncodeEeScalarOrientationFromLegacyFacing(uint16_t facing) {
+  constexpr double kFullTurn = 360.0;
+  double degrees =
+      (static_cast<double>(facing) * kFullTurn / 65536.0) - 90.0;
+  while (degrees < 0.0) {
+    degrees += kFullTurn;
+  }
+  while (degrees >= kFullTurn) {
+    degrees -= kFullTurn;
+  }
+  uint32_t raw = static_cast<uint32_t>(degrees * 10.0 + 0.000001);
+  if (raw > 0x0FFFu) {
+    raw = 0x0FFFu;
+  }
+  return static_cast<uint16_t>(raw);
+}
+
+std::vector<unsigned char> BuildEeDoorPlaceableGenericUpdateBytes(
+    const LegacyLiveNamedUpdateTail& legacy_tail,
+    uint32_t translated_mask,
+    uint16_t* orientation_scalar12) {
+  if (orientation_scalar12 != nullptr) {
+    *orientation_scalar12 = 0;
+  }
+
+  std::vector<unsigned char> rewritten;
+  rewritten.reserve(
+      kEeLiveObjectUpdateOrientationScalarReadBytes +
+      kEeLiveObjectUpdateScaleStateReadBytes);
+  if ((translated_mask & kLegacyLiveObjectUpdateOrientationMask) != 0) {
+    const uint16_t scalar12 =
+        EncodeEeScalarOrientationFromLegacyFacing(legacy_tail.facing);
+    rewritten.push_back(static_cast<unsigned char>((scalar12 >> 4) & 0xFFu));
+    if (orientation_scalar12 != nullptr) {
+      *orientation_scalar12 = scalar12;
+    }
+  }
+  if ((translated_mask & kLegacyLiveObjectUpdateScaleStateMask) != 0) {
+    const size_t offset = rewritten.size();
+    rewritten.resize(offset + kEeLiveObjectUpdateScaleStateReadBytes);
+    WriteU32Le(rewritten.data() + offset, legacy_tail.scale_raw);
+    WriteU16Le(rewritten.data() + offset + 4, legacy_tail.generic_state_word);
+  }
+  return rewritten;
 }
 
 bool IsLegacyDoorModelTokenByte(unsigned char value) {
@@ -7401,9 +8881,106 @@ std::wstring FormatCnwBitSlice(
     const std::vector<unsigned char>& bits,
     size_t start,
     size_t count);
+size_t CountAreaPlaceableRowsWithAppearance(
+    const std::vector<AreaPlaceableContextRow>& rows,
+    uint16_t appearance);
+size_t CountAreaPlaceableRowsWithAppearanceNear2d(
+    const std::vector<AreaPlaceableContextRow>& rows,
+    uint16_t appearance,
+    float x,
+    float y,
+    double max_distance);
+bool FindLivePlaceableAddContext(
+    const BridgeRuntime* runtime,
+    uint32_t object_id,
+    LivePlaceableAddContextRow* context);
+bool TryFindPlaceableAddContextInLiveBytes(
+    const std::vector<unsigned char>& bytes,
+    uint32_t object_id,
+    LivePlaceableAddContextRow* context);
+LivePlaceableSemanticBits MakeLivePlaceableUpdateDestinationSemanticBits(
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor);
+LivePlaceableSemanticBits MakeLivePlaceableAddDestinationSemanticBits(
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor,
+    bool short_locstring,
+    bool inline_locstring_name);
+std::wstring RememberLivePlaceableUpdateState(
+    BridgeRuntime* runtime,
+    uint32_t object_id,
+    const LivePlaceableSemanticBits& update_state,
+    bool has_position,
+    float x,
+    float y,
+    float z);
+std::wstring FormatLivePlaceableAddUpdateDelta(
+    const LivePlaceableSemanticBits& add_state,
+    const LivePlaceableSemanticBits& update_state);
+double AreaPositionDistance2d(
+    const AreaPlaceableContextRow& row,
+    float x,
+    float y);
+float DecodeNwnCnwQuantizedFloat(uint32_t raw, float divisor);
+float DecodeNwnCnwRangedFloat(uint32_t raw, float min_value, float max_value, uint32_t bits);
+uint32_t DecodeLiveObjectUpdateZRaw(
+    uint16_t fixed_z,
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor);
+std::wstring FormatNearestAreaPlaceableRowsWithAppearancePreview(
+    const std::vector<AreaPlaceableContextRow>& rows,
+    uint16_t appearance,
+    float x,
+    float y,
+    float z,
+    size_t max_count);
+
+std::wstring FormatLivePlaceableUpdateStateBitMap(
+    const std::vector<unsigned char>& before_bits,
+    size_t before_cursor,
+    const std::vector<unsigned char>& after_bits,
+    size_t after_cursor) {
+  auto append_bit = [](std::wstring* text,
+                       const wchar_t* label,
+                       const std::vector<unsigned char>& bits,
+                       size_t index) {
+    if (!text->empty() && text->back() != L'[') {
+      *text += L" ";
+    }
+    *text += label;
+    *text += L"=";
+    if (index >= bits.size()) {
+      *text += L"?";
+    } else {
+      *text += bits[index] != 0 ? L"1" : L"0";
+    }
+    *text += L"@";
+    *text += std::to_wstring(index);
+  };
+
+  std::wstring text = L"placeable_state{src_cursor=";
+  text += std::to_wstring(before_cursor);
+  text += L" src[";
+  append_bit(&text, L"legacy_10c_visual_selector", before_bits, before_cursor);
+  append_bit(&text, L"legacy_104_visual_gate", before_bits, before_cursor + 1);
+  append_bit(&text, L"legacy_100_to_ee_19c_locked", before_bits, before_cursor + 2);
+  append_bit(&text, L"legacy_0fc_to_ee_198_lockable", before_bits, before_cursor + 3);
+  append_bit(&text, L"legacy_11c_visual_payload", before_bits, before_cursor + 4);
+  text += L"] dst_cursor=";
+  text += std::to_wstring(after_cursor);
+  text += L" dst[";
+  append_bit(&text, L"ee_1a8_visual_selector", after_bits, after_cursor);
+  append_bit(&text, L"ee_1a0_visual_gate", after_bits, after_cursor + 1);
+  append_bit(&text, L"ee_19c_locked", after_bits, after_cursor + 2);
+  append_bit(&text, L"ee_198_lockable", after_bits, after_cursor + 3);
+  append_bit(&text, L"ee_1b4_visual_payload", after_bits, after_cursor + 4);
+  text += L"]}";
+  return text;
+}
 
 void AppendLiveUpdateRecordRewriteDiagnostic(
     LiveObjectUpdateRewriteResult* result,
+    BridgeRuntime* runtime,
     const std::vector<unsigned char>& bytes,
     size_t record_offset,
     size_t record_end,
@@ -7419,8 +8996,11 @@ void AppendLiveUpdateRecordRewriteDiagnostic(
     uint32_t flattened_names,
     const std::vector<unsigned char>& before_bits,
     const std::vector<unsigned char>& after_bits,
+    const LegacyLiveNamedUpdateTail* legacy_tail,
+    bool legacy_tail_ready,
+    const wchar_t* legacy_tail_probe,
     const wchar_t* reason) {
-  if (result == nullptr || result->diagnostics.size() > 5200) {
+  if (result == nullptr || result->diagnostics.size() > 6500) {
     return;
   }
 
@@ -7430,13 +9010,16 @@ void AppendLiveUpdateRecordRewriteDiagnostic(
       : 0;
   const bool has_position =
       (translated_mask & kLegacyLiveObjectUpdatePositionMask) != 0;
+  const bool has_orientation =
+      (translated_mask & kLegacyLiveObjectUpdateOrientationMask) != 0;
+  const bool has_scale_state =
+      (translated_mask & kLegacyLiveObjectUpdateScaleStateMask) != 0;
   const bool has_state =
       (translated_mask & kLegacyLiveObjectUpdateStateMask) != 0;
   const bool has_name =
       (translated_mask & kLegacyLiveObjectUpdateNameMask) != 0;
   const size_t expected_name_offset =
-      record_offset + 10 +
-      (has_position ? kLegacyLiveObjectUpdatePositionReadBytes : 0);
+      DoorPlaceableEeUpdateNameCursor(record_offset, translated_mask);
 
   std::string name_preview;
   uint32_t name_length = 0;
@@ -7455,10 +9038,33 @@ void AppendLiveUpdateRecordRewriteDiagnostic(
   uint16_t fixed_x = 0;
   uint16_t fixed_y = 0;
   uint16_t fixed_z = 0;
+  uint32_t fixed_z_raw = 0;
+  float decoded_x = 0.0f;
+  float decoded_y = 0.0f;
+  float decoded_z = 0.0f;
   if (has_position && record_offset + 16 <= bytes.size()) {
     (void)TryReadU16LeFromBytes(bytes, record_offset + 10, &fixed_x);
     (void)TryReadU16LeFromBytes(bytes, record_offset + 12, &fixed_y);
     (void)TryReadU16LeFromBytes(bytes, record_offset + 14, &fixed_z);
+    fixed_z_raw = DecodeLiveObjectUpdateZRaw(fixed_z, before_bits, bit_cursor_before);
+    decoded_x = DecodeNwnCnwQuantizedFloat(fixed_x, 100.0f);
+    decoded_y = DecodeNwnCnwQuantizedFloat(fixed_y, 100.0f);
+    decoded_z = DecodeNwnCnwRangedFloat(fixed_z_raw, -20.0f, 320.0f, 18);
+  }
+  const size_t ee_tail_offset =
+      record_offset + 10 +
+      (has_position ? kLegacyLiveObjectUpdatePositionReadBytes : 0);
+  uint8_t orientation_scalar_hi = 0;
+  float scale = 0.0f;
+  uint16_t generic_state_word = 0;
+  if (has_orientation && ee_tail_offset < bytes.size()) {
+    orientation_scalar_hi = bytes[ee_tail_offset];
+  }
+  const size_t scale_offset = ee_tail_offset +
+      (has_orientation ? kEeLiveObjectUpdateOrientationScalarReadBytes : 0);
+  if (has_scale_state && scale_offset + kEeLiveObjectUpdateScaleStateReadBytes <= bytes.size()) {
+    (void)TryReadFloatLeFromBytes(bytes, scale_offset, &scale);
+    (void)TryReadU16LeFromBytes(bytes, scale_offset + 4, &generic_state_word);
   }
 
   const size_t bit_slice_start = bit_cursor_before >= 6 ? bit_cursor_before - 6 : 0;
@@ -7467,11 +9073,98 @@ void AppendLiveUpdateRecordRewriteDiagnostic(
       FormatCnwBitSlice(before_bits, bit_slice_start, bit_slice_count);
   const std::wstring after_slice =
       FormatCnwBitSlice(after_bits, bit_slice_start, bit_slice_count);
+  std::wstring placeable_state_map = L"";
+  LivePlaceableSemanticBits placeable_update_state;
+  std::wstring placeable_state_history = L"state_history=n/a";
+  if (object_type == 9 && has_state) {
+    const size_t source_state_cursor = bit_cursor_before +
+        (has_position ? kLegacyLiveObjectUpdatePositionFragmentBits : 0);
+    const size_t destination_state_cursor = source_state_cursor +
+        (has_orientation ? kEeLiveObjectUpdateOrientationScalarFragmentBits : 0);
+    placeable_update_state =
+        MakeLivePlaceableUpdateDestinationSemanticBits(after_bits, destination_state_cursor);
+    placeable_state_map = FormatLivePlaceableUpdateStateBitMap(
+        before_bits,
+        source_state_cursor,
+        after_bits,
+        destination_state_cursor);
+    placeable_state_history = RememberLivePlaceableUpdateState(
+        runtime,
+        object_id,
+        placeable_update_state,
+        has_position,
+        decoded_x,
+        decoded_y,
+        decoded_z);
+  }
 
-  wchar_t text[1700]{};
+  LivePlaceableAddContextRow live_placeable_context;
+  const bool has_live_placeable_context =
+      object_type == 9 &&
+      (FindLivePlaceableAddContext(runtime, object_id, &live_placeable_context) ||
+       TryFindPlaceableAddContextInLiveBytes(bytes, object_id, &live_placeable_context));
+  const uint16_t live_placeable_appearance = has_live_placeable_context
+      ? live_placeable_context.appearance
+      : generic_state_word;
+  const size_t nearest_static_same_app_count =
+      (runtime != nullptr && object_type == 9)
+          ? CountAreaPlaceableRowsWithAppearance(
+                runtime->latest_area_static_placeable_rows,
+                live_placeable_appearance)
+          : 0;
+  const size_t nearest_light_same_app_count =
+      (runtime != nullptr && object_type == 9)
+          ? CountAreaPlaceableRowsWithAppearance(
+                runtime->latest_area_placeable_light_rows,
+                live_placeable_appearance)
+          : 0;
+  const size_t near_static_same_app_count =
+      (runtime != nullptr && object_type == 9 && has_position)
+          ? CountAreaPlaceableRowsWithAppearanceNear2d(
+                runtime->latest_area_static_placeable_rows,
+                live_placeable_appearance,
+                decoded_x,
+                decoded_y,
+                2.0)
+          : 0;
+  const size_t near_light_same_app_count =
+      (runtime != nullptr && object_type == 9 && has_position)
+          ? CountAreaPlaceableRowsWithAppearanceNear2d(
+                runtime->latest_area_placeable_light_rows,
+                live_placeable_appearance,
+                decoded_x,
+                decoded_y,
+                2.0)
+          : 0;
+  const std::wstring nearest_static_same_app_preview =
+      (runtime != nullptr && object_type == 9 && has_position)
+          ? FormatNearestAreaPlaceableRowsWithAppearancePreview(
+                runtime->latest_area_static_placeable_rows,
+                live_placeable_appearance,
+                decoded_x,
+                decoded_y,
+                decoded_z,
+                4)
+          : L"<none>";
+  const std::wstring nearest_light_same_app_preview =
+      (runtime != nullptr && object_type == 9 && has_position)
+          ? FormatNearestAreaPlaceableRowsWithAppearancePreview(
+                runtime->latest_area_placeable_light_rows,
+                live_placeable_appearance,
+                decoded_x,
+                decoded_y,
+                decoded_z,
+                4)
+          : L"<none>";
+  const std::wstring live_placeable_name =
+      has_live_placeable_context
+          ? AsciiPreviewToWide(live_placeable_context.name, 64)
+          : L"<unknown>";
+
+  wchar_t text[5600]{};
   swprintf_s(
       text,
-      L"%s+%zu U %s id=0x%08X mask=0x%08X->0x%08X len=%zu->%zu bits[cursor=%zu->%zu inserted=%u before=%s after=%s] flags[pos=%d state=%d name=%d] fixed=[0x%04X,0x%04X,0x%04X] name_off=%zu name_ready=%d name_len=%u name='%s' removed=%u flattened=%u reason=%s raw=[%s]",
+      L"%s+%zu U %s id=0x%08X mask=0x%08X->0x%08X len=%zu->%zu bits[cursor=%zu->%zu inserted=%u before=%s after=%s] flags[pos=%d orient=%d scale=%d state=%d name=%d] %s %s fixed=[0x%04X,0x%04X,0x%04X:%u] pos=[%.2f,%.2f,%.2f] orient_hi=0x%02X scale=%.3f state_word=0x%04X live_add[known=%d appearance=0x%04X/%u name='%s' same_app_static=%zu near_static<=2m=%zu:%s same_app_light=%zu near_light<=2m=%zu:%s] legacy_tail[ready=%d facing=0x%04X/%u state_byte=0x%02X/%u scale=%.3f state_word=0x%04X probe='%s'] name_off=%zu name_ready=%d name_len=%u name='%s' removed=%u flattened=%u reason=%s raw=[%s]",
       result->diagnostics.empty() ? L"" : L"; ",
       record_offset,
       LegacyLiveObjectTypeName(object_type),
@@ -7486,11 +9179,40 @@ void AppendLiveUpdateRecordRewriteDiagnostic(
       before_slice.c_str(),
       after_slice.c_str(),
       has_position ? 1 : 0,
+      has_orientation ? 1 : 0,
+      has_scale_state ? 1 : 0,
       has_state ? 1 : 0,
       has_name ? 1 : 0,
+      placeable_state_map.empty() ? L"state_map=n/a" : placeable_state_map.c_str(),
+      placeable_state_history.c_str(),
       static_cast<unsigned int>(fixed_x),
       static_cast<unsigned int>(fixed_y),
       static_cast<unsigned int>(fixed_z),
+      fixed_z_raw,
+      static_cast<double>(decoded_x),
+      static_cast<double>(decoded_y),
+      static_cast<double>(decoded_z),
+      static_cast<unsigned int>(orientation_scalar_hi),
+      static_cast<double>(scale),
+      static_cast<unsigned int>(generic_state_word),
+      has_live_placeable_context ? 1 : 0,
+      static_cast<unsigned int>(live_placeable_appearance),
+      static_cast<unsigned int>(live_placeable_appearance),
+      live_placeable_name.c_str(),
+      nearest_static_same_app_count,
+      near_static_same_app_count,
+      nearest_static_same_app_preview.c_str(),
+      nearest_light_same_app_count,
+      near_light_same_app_count,
+      nearest_light_same_app_preview.c_str(),
+      legacy_tail_ready ? 1 : 0,
+      legacy_tail != nullptr ? static_cast<unsigned int>(legacy_tail->facing) : 0u,
+      legacy_tail != nullptr ? static_cast<unsigned int>(legacy_tail->facing) : 0u,
+      legacy_tail != nullptr ? static_cast<unsigned int>(legacy_tail->state_byte) : 0u,
+      legacy_tail != nullptr ? static_cast<unsigned int>(legacy_tail->state_byte) : 0u,
+      legacy_tail != nullptr ? static_cast<double>(legacy_tail->scale) : 0.0,
+      legacy_tail != nullptr ? static_cast<unsigned int>(legacy_tail->generic_state_word) : 0u,
+      legacy_tail_probe != nullptr ? legacy_tail_probe : L"",
       expected_name_offset,
       name_ready ? 1 : 0,
       name_length,
@@ -7559,7 +9281,11 @@ bool FindLegacyLiveUpdateShortNameEndingNear(
     }
 
     const size_t anchored_name_offset = cursor + 9;
-    if (!LooksLikeLegacyLiveNamedUpdateTail9(bytes, cursor) ||
+    if (!TryReadAnchoredLegacyLiveNamedUpdateTail9(
+            bytes,
+            cursor,
+            nullptr,
+            nullptr) ||
         LooksLikeInlineCExoStringAt(
             bytes,
             anchored_name_offset,
@@ -7603,6 +9329,98 @@ bool FindLegacyLiveUpdateShortNameEndingNear(
   return false;
 }
 
+bool TryRecoverLegacyLiveUpdateEmptyInlineFallbackName(
+    const std::vector<unsigned char>& bytes,
+    unsigned char object_type,
+    size_t record_start,
+    size_t record_end,
+    uint32_t raw_mask,
+    size_t* tail_offset,
+    size_t* length_offset,
+    size_t* text_start,
+    size_t* text_end) {
+  if (tail_offset != nullptr) {
+    *tail_offset = SIZE_MAX;
+  }
+  if (length_offset != nullptr) {
+    *length_offset = SIZE_MAX;
+  }
+  if (text_start != nullptr) {
+    *text_start = SIZE_MAX;
+  }
+  if (text_end != nullptr) {
+    *text_end = SIZE_MAX;
+  }
+  if ((object_type != 9 && object_type != 10) ||
+      (raw_mask & kLegacyLiveObjectUpdateNameMask) == 0 ||
+      record_start > bytes.size() ||
+      record_end > bytes.size() ||
+      record_end <= record_start) {
+    return false;
+  }
+
+  const size_t legacy_tail_offset = DoorPlaceableUpdateNameCursor(record_start, raw_mask);
+  if (legacy_tail_offset > record_end ||
+      record_end - legacy_tail_offset < 9 + 4 + 1 ||
+      !TryReadAnchoredLegacyLiveNamedUpdateTail9(
+          bytes,
+          legacy_tail_offset,
+          nullptr,
+          nullptr)) {
+    return false;
+  }
+
+  const size_t candidate_length_offset = legacy_tail_offset + 9;
+  if (candidate_length_offset > record_end ||
+      record_end - candidate_length_offset < 4 ||
+      ReadU32Le(bytes.data() + candidate_length_offset) != 0) {
+    return false;
+  }
+
+  size_t inline_end = 0;
+  if (LooksLikeInlineCExoStringAt(
+          bytes,
+          candidate_length_offset,
+          nullptr,
+          &inline_end,
+          nullptr) &&
+      inline_end <= record_end &&
+      record_end - inline_end <= 4) {
+    return false;
+  }
+
+  const size_t candidate_text_start = candidate_length_offset + 4;
+  constexpr size_t kMaxLegacyBareUpdateNameBytes = 128;
+  const size_t candidate_text_limit =
+      std::min(record_end, candidate_text_start + kMaxLegacyBareUpdateNameBytes);
+  for (size_t candidate_text_end = candidate_text_start + 1;
+       candidate_text_end <= candidate_text_limit;
+       ++candidate_text_end) {
+    if (!IsLegacyBareActiveItemNameByte(bytes[candidate_text_end - 1])) {
+      break;
+    }
+    if (candidate_text_end != record_end) {
+      continue;
+    }
+
+    if (tail_offset != nullptr) {
+      *tail_offset = legacy_tail_offset;
+    }
+    if (length_offset != nullptr) {
+      *length_offset = candidate_length_offset;
+    }
+    if (text_start != nullptr) {
+      *text_start = candidate_text_start;
+    }
+    if (text_end != nullptr) {
+      *text_end = candidate_text_end;
+    }
+    return true;
+  }
+
+  return false;
+}
+
 bool LooksLikeLegacyDoorUpdateModelTokenAt(
     const std::vector<unsigned char>& bytes,
     size_t token_offset,
@@ -7632,12 +9450,15 @@ bool TryFindPlaceableAddNameForAddRecordRewrite(
     size_t record_end,
     size_t* name_offset,
     size_t* tail_offset,
-    bool* short_locstring);
+    bool* short_locstring,
+    size_t* fallback_name_length_offset = nullptr,
+    size_t* fallback_name_text_start = nullptr,
+    size_t* fallback_name_text_end = nullptr);
 bool TryReadLegacyTriggerAddShape(
     const std::vector<unsigned char>& bytes,
     size_t record_offset,
     size_t record_end,
-    uint8_t* primary_flag,
+    uint8_t* cursor_byte,
     uint8_t* vertex_count);
 bool ShouldSkipLegacyLiveShortAddRecordBytes(
     const BridgeRuntime* runtime,
@@ -7662,6 +9483,108 @@ bool LooksLikeLegacyCreatureAddTransformFields(
     const std::vector<unsigned char>& bytes,
     size_t offset,
     size_t record_end);
+
+bool TryGetLegacyTriggerAddFragmentBitSpan(
+    const std::vector<unsigned char>& bytes,
+    const std::vector<unsigned char>& bits,
+    size_t record_offset,
+    size_t record_end,
+    size_t bit_cursor,
+    size_t* bit_span,
+    bool* locstring_name_branch,
+    bool* first_state,
+    bool* second_state,
+    bool* third_state_present,
+    bool* third_state,
+    uint8_t* cursor_byte,
+    uint8_t* vertex_count) {
+  if (bit_span != nullptr) {
+    *bit_span = 0;
+  }
+  if (locstring_name_branch != nullptr) {
+    *locstring_name_branch = false;
+  }
+  if (first_state != nullptr) {
+    *first_state = false;
+  }
+  if (second_state != nullptr) {
+    *second_state = false;
+  }
+  if (third_state_present != nullptr) {
+    *third_state_present = false;
+  }
+  if (third_state != nullptr) {
+    *third_state = false;
+  }
+  if (cursor_byte != nullptr) {
+    *cursor_byte = 0;
+  }
+  if (vertex_count != nullptr) {
+    *vertex_count = 0;
+  }
+
+  uint8_t observed_cursor = 0;
+  uint8_t observed_vertices = 0;
+  if (!TryReadLegacyTriggerAddShape(
+          bytes,
+          record_offset,
+          record_end,
+          &observed_cursor,
+          &observed_vertices) ||
+      bit_cursor >= bits.size()) {
+    return false;
+  }
+
+  const bool name_is_locstring = bits[bit_cursor] != 0;
+  const size_t minimum_bits = name_is_locstring ? 4 : 3;
+  if (bits.size() - bit_cursor < minimum_bits) {
+    return false;
+  }
+
+  if (!name_is_locstring &&
+      !LooksLikeInlineCExoStringAt(
+          bytes,
+          record_offset + 6,
+          nullptr,
+          nullptr,
+          nullptr)) {
+    return false;
+  }
+
+  const size_t first_state_bit = bit_cursor + (name_is_locstring ? 2 : 1);
+  const size_t second_state_bit = first_state_bit + 1;
+  const bool first = bits[first_state_bit] != 0;
+  const size_t span = minimum_bits + (first ? 1 : 0);
+  if (bits.size() - bit_cursor < span) {
+    return false;
+  }
+
+  if (bit_span != nullptr) {
+    *bit_span = span;
+  }
+  if (locstring_name_branch != nullptr) {
+    *locstring_name_branch = name_is_locstring;
+  }
+  if (first_state != nullptr) {
+    *first_state = first;
+  }
+  if (second_state != nullptr) {
+    *second_state = bits[second_state_bit] != 0;
+  }
+  if (third_state_present != nullptr) {
+    *third_state_present = first;
+  }
+  if (third_state != nullptr) {
+    *third_state = first ? bits[second_state_bit + 1] != 0 : false;
+  }
+  if (cursor_byte != nullptr) {
+    *cursor_byte = observed_cursor;
+  }
+  if (vertex_count != nullptr) {
+    *vertex_count = observed_vertices;
+  }
+  return true;
+}
 
 bool AdvanceLegacyLiveAddRecordBitCursor(
     const std::vector<unsigned char>& bytes,
@@ -7736,29 +9659,65 @@ bool AdvanceLegacyLiveAddRecordBitCursor(
     if (*bit_cursor >= bits.size()) {
       return false;
     }
-    // Legacy placeable adds own ten BOOLs: one name-mode bit plus nine
-    // post-name flags. Inline names with a true outer locstring flag also own
-    // the existing locstring inner/client-tlk bit before those post-name
-    // flags. The EE-only final visual flag and the short-locstring inner flag
-    // are inserted by RewriteLegacyLiveObjectAddRecords.
-    const bool inline_locstring_name = !short_locstring && bits[*bit_cursor] != 0;
+    // HG's legacy placeable add stream owns ten BOOLs here: one name-mode bit,
+    // one first post-name state bit, one legacy gate at EE's optional-target
+    // read site that must be consumed but returned false, and seven following
+    // state/action bits. Inline names with a true outer locstring flag also own
+    // the existing locstring inner/client-tlk bit before those post-name flags.
+    // The direct CExoString/outer=1/inner=1 contradiction handled by the
+    // add-record rewrite treats that would-be inner bit as the first post-name
+    // state bit, so the source span stays ten bits. The EE optional-target
+    // value, final LoadLight bit, and short-locstring inner flag are inserted
+    // by RewriteLegacyLiveObjectAddRecords.
+    bool direct_inline_name_payload = false;
+    if (!short_locstring) {
+      uint32_t ignored_name_length = 0;
+      size_t ignored_name_end = 0;
+      direct_inline_name_payload = LooksLikeInlineCExoStringAt(
+          bytes,
+          name_offset,
+          &ignored_name_length,
+          &ignored_name_end,
+          nullptr) &&
+          ignored_name_end <= record_end;
+    }
+    const bool legacy_outer_locstring = bits[*bit_cursor] != 0;
+    const bool legacy_inner_client_tlk =
+        !short_locstring &&
+        legacy_outer_locstring &&
+        *bit_cursor + 1 < bits.size() &&
+        bits[*bit_cursor + 1] != 0;
+    const bool direct_name_mode_repair =
+        legacy_outer_locstring &&
+        legacy_inner_client_tlk &&
+        direct_inline_name_payload;
+    const bool inline_locstring_name =
+        !short_locstring &&
+        legacy_outer_locstring &&
+        !direct_name_mode_repair;
     *bit_cursor += inline_locstring_name ? 11 : 10;
     return true;
   }
 
   if (object_type == 7) {
-    uint8_t primary_flag = 0;
-    uint8_t vertex_count = 0;
-    if (!TryReadLegacyTriggerAddShape(
+    size_t source_bits = 0;
+    if (!TryGetLegacyTriggerAddFragmentBitSpan(
             bytes,
+            bits,
             record_offset,
             record_end,
-            &primary_flag,
-            &vertex_count)) {
+            *bit_cursor,
+            &source_bits,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr)) {
       return false;
     }
-    (void)primary_flag;
-    (void)vertex_count;
+    *bit_cursor += source_bits;
     return true;
   }
 
@@ -7829,11 +9788,18 @@ bool AdvanceRewrittenLiveUpdateRecordBitCursor(
 
   const wchar_t* reason = L"";
   const uint32_t translated_mask =
-      TranslateLegacyLiveObjectUpdateMask(object_type, raw_mask, &reason);
+      ((object_type == 9 || object_type == 10) &&
+       IsEeShapedDoorPlaceableUpdateMask(raw_mask))
+          ? raw_mask
+          : TranslateLegacyLiveObjectUpdateMask(object_type, raw_mask, &reason);
   (void)reason;
   if ((object_type == 7 || object_type == 9 || object_type == 10) &&
       (translated_mask & kLegacyLiveObjectUpdatePositionMask) != 0) {
     *bit_cursor += kLegacyLiveObjectUpdatePositionFragmentBits;
+  }
+  if ((object_type == 9 || object_type == 10) &&
+      (translated_mask & kLegacyLiveObjectUpdateOrientationMask) != 0) {
+    *bit_cursor += kEeLiveObjectUpdateOrientationScalarFragmentBits;
   }
   if ((translated_mask & kLegacyLiveObjectUpdateStateMask) != 0) {
     *bit_cursor += object_type == 10
@@ -8732,6 +10698,132 @@ bool TrySimulateLegacyLiveCreatureUpdateCursors(
 
   *bit_cursor = cursor.bit_cursor;
   return true;
+}
+
+bool TryRewriteLegacyCreatureUpdateBareSecondIdentityString(
+    std::vector<unsigned char>* bytes,
+    size_t record_offset,
+    size_t record_end,
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor,
+    size_t* advanced_bit_cursor,
+    std::wstring* detail) {
+  if (advanced_bit_cursor != nullptr) {
+    *advanced_bit_cursor = bit_cursor;
+  }
+  if (detail != nullptr) {
+    detail->clear();
+  }
+  if (bytes == nullptr ||
+      record_offset > bytes->size() ||
+      record_end > bytes->size() ||
+      record_end <= record_offset ||
+      record_end - record_offset < 10 ||
+      (*bytes)[record_offset] != 'U' ||
+      (*bytes)[record_offset + 1] != 5 ||
+      !LooksLikeLegacyLiveObjectIdAt(*bytes, record_offset + 2)) {
+    return false;
+  }
+
+  uint32_t raw_mask = 0;
+  if (!TryReadU32LeFromBytes(*bytes, record_offset + 6, &raw_mask) ||
+      (raw_mask & 0x00001000u) == 0 ||
+      !IsSupportedLegacyCreatureUpdateCursorMask(raw_mask)) {
+    return false;
+  }
+
+  const size_t scan_begin = record_offset + 10;
+  const size_t scan_end =
+      std::min(record_end, record_offset + static_cast<size_t>(96));
+  for (size_t identity_offset = scan_begin;
+       identity_offset + 6 < scan_end;
+       ++identity_offset) {
+    uint16_t identity_word = 0;
+    uint32_t first_length = 0;
+    if (!TryReadU16LeFromBytes(*bytes, identity_offset, &identity_word) ||
+        !TryReadU32LeFromBytes(*bytes, identity_offset + 2, &first_length) ||
+        first_length != 0) {
+      continue;
+    }
+
+    const size_t text_start = identity_offset + 6;
+    const size_t text_limit =
+        std::min(record_end, text_start + static_cast<size_t>(32));
+    for (size_t text_end = text_start + 1;
+         text_end <= text_limit;
+         ++text_end) {
+      if (!IsLegacyBareActiveItemNameByte((*bytes)[text_end - 1])) {
+        break;
+      }
+      if (text_end + 4 > record_end) {
+        continue;
+      }
+      bool four_zero_padding = true;
+      for (size_t padding = 0; padding < 4; ++padding) {
+        if ((*bytes)[text_end + padding] != 0) {
+          four_zero_padding = false;
+          break;
+        }
+      }
+      if (!four_zero_padding) {
+        continue;
+      }
+
+      const size_t text_length = text_end - text_start;
+      if (text_length == 0 || text_length > 32) {
+        continue;
+      }
+
+      std::vector<unsigned char> candidate = *bytes;
+      std::vector<unsigned char> text(
+          candidate.begin() + static_cast<std::ptrdiff_t>(text_start),
+          candidate.begin() + static_cast<std::ptrdiff_t>(text_end));
+      WriteU32Le(
+          candidate.data() + text_start,
+          static_cast<uint32_t>(text_length));
+      std::copy(
+          text.begin(),
+          text.end(),
+          candidate.begin() + static_cast<std::ptrdiff_t>(text_start + 4));
+
+      size_t trial_bit_cursor = bit_cursor;
+      std::wstring validation_failure;
+      if (!TrySimulateLegacyLiveCreatureUpdateCursors(
+              candidate,
+              record_offset,
+              record_end,
+              bits,
+              &trial_bit_cursor,
+              &validation_failure)) {
+        continue;
+      }
+
+      if (detail != nullptr) {
+        std::string preview(
+            reinterpret_cast<const char*>(text.data()),
+            reinterpret_cast<const char*>(text.data() + text.size()));
+        wchar_t text_detail[320]{};
+        swprintf_s(
+            text_detail,
+            L"identity_offset=%zu word=0x%04X text_len=%zu suffix=%zu bit=%zu->%zu text='%s'",
+            identity_offset,
+            static_cast<unsigned int>(identity_word),
+            text_length,
+            text_end + 4,
+            bit_cursor,
+            trial_bit_cursor,
+            AsciiPreviewToWide(preview, 64).c_str());
+        *detail = text_detail;
+      }
+      *bytes = std::move(candidate);
+      if (advanced_bit_cursor != nullptr) {
+        *advanced_bit_cursor = trial_bit_cursor;
+      }
+      return true;
+    }
+  }
+
+  return false;
 }
 
 bool TryGetKnownLegacyLiveCreatureUpdateFragmentBitCount(
@@ -9744,8 +11836,13 @@ bool LegacyLiveUpdateNamePayloadReady(
       return false;
     }
 
+    LegacyLiveNamedUpdateTail legacy_tail{};
     const size_t legacy_name_offset = cursor + 9;
-    if (LooksLikeLegacyLiveNamedUpdateTail9(bytes, cursor) &&
+    if (TryReadAnchoredLegacyLiveNamedUpdateTail9(
+            bytes,
+            cursor,
+            &legacy_tail,
+            nullptr) &&
         legacy_name_offset + 4 <= record_end) {
       if (LooksLikeInlineCExoStringAt(
               bytes,
@@ -9757,7 +11854,10 @@ bool LegacyLiveUpdateNamePayloadReady(
           record_end - name_end <= 4) {
         return true;
       }
-      return record_end - (legacy_name_offset + 4) <= 4;
+      return LegacyLiveNamedUpdateTailFollowingPayloadReady(
+          bytes,
+          cursor,
+          record_end);
     }
 
     return false;
@@ -9801,7 +11901,9 @@ bool CanFlattenLegacyLiveBadUpdateNamePayload(
   // read pointer to the next submessage while returning an empty name. Packet
   // side, keep those six position bytes and replace the remaining legacy tail
   // with an empty EE string.
-  const size_t candidate = DoorPlaceableUpdateNameCursor(record_start, translated_mask);
+  uint32_t raw_mask = translated_mask;
+  (void)TryReadU32LeFromBytes(bytes, record_start + 6, &raw_mask);
+  const size_t candidate = DoorPlaceableUpdateNameCursor(record_start, raw_mask);
   if (candidate > record_end || record_end - candidate < 4) {
     return false;
   }
@@ -9832,6 +11934,12 @@ bool CanRewriteLegacyLiveObjectUpdateBits(
       return false;
     }
     cursor += kLegacyLiveObjectUpdatePositionFragmentBits;
+  }
+
+  if ((object_type == 9 || object_type == 10) &&
+      (translated_mask & kLegacyLiveObjectUpdateOrientationMask) != 0) {
+    available_bits += kEeLiveObjectUpdateOrientationScalarFragmentBits;
+    cursor += kEeLiveObjectUpdateOrientationScalarFragmentBits;
   }
 
   if ((translated_mask & kLegacyLiveObjectUpdateStateMask) != 0) {
@@ -9927,9 +12035,11 @@ bool IsSkippedLegacyLiveShortAddObject(
 bool InsertLegacyLiveObjectUpdateBits(
     unsigned char object_type,
     uint32_t translated_mask,
+    uint16_t orientation_scalar12,
     std::vector<unsigned char>* bits,
     size_t* bit_cursor,
     uint32_t* inserted_bits,
+    uint32_t* orientation_bits,
     uint32_t* door_extra_bits,
     uint32_t* name_mode_bits,
     uint32_t* placeable_state_bits_remapped) {
@@ -9938,6 +12048,9 @@ bool InsertLegacyLiveObjectUpdateBits(
   }
   if (door_extra_bits != nullptr) {
     *door_extra_bits = 0;
+  }
+  if (orientation_bits != nullptr) {
+    *orientation_bits = 0;
   }
   if (name_mode_bits != nullptr) {
     *name_mode_bits = 0;
@@ -9952,6 +12065,7 @@ bool InsertLegacyLiveObjectUpdateBits(
 
   size_t cursor = *bit_cursor;
   uint32_t local_inserted = 0;
+  uint32_t local_orientation_bits = 0;
   uint32_t local_door_extra = 0;
   uint32_t local_name_mode = 0;
   uint32_t local_placeable_state_remapped = 0;
@@ -9961,6 +12075,23 @@ bool InsertLegacyLiveObjectUpdateBits(
       return false;
     }
     cursor += kLegacyLiveObjectUpdatePositionFragmentBits;
+  }
+
+  if ((object_type == 9 || object_type == 10) &&
+      (translated_mask & kLegacyLiveObjectUpdateOrientationMask) != 0) {
+    std::vector<unsigned char> inserted_orientation_bits;
+    inserted_orientation_bits.reserve(kEeLiveObjectUpdateOrientationScalarFragmentBits);
+    inserted_orientation_bits.push_back(0);
+    for (int shift = 3; shift >= 0; --shift) {
+      inserted_orientation_bits.push_back(
+          ((orientation_scalar12 >> shift) & 1u) != 0 ? 1 : 0);
+    }
+    if (!InsertCnwMsbBits(bits, cursor, inserted_orientation_bits)) {
+      return false;
+    }
+    cursor += inserted_orientation_bits.size();
+    local_inserted += static_cast<uint32_t>(inserted_orientation_bits.size());
+    local_orientation_bits += static_cast<uint32_t>(inserted_orientation_bits.size());
   }
 
   if ((translated_mask & kLegacyLiveObjectUpdateStateMask) != 0) {
@@ -9985,7 +12116,7 @@ bool InsertLegacyLiveObjectUpdateBits(
         }
         // Diamond and EE both read five placeable update BOOLs here. The
         // client storage offsets changed, but the update helper semantics did
-        // not: Diamond sub_523D40 and EE sub_140870B80 both use the first
+        // not: Diamond sub_524C30 and EE sub_140870B80 both use the first
         // just-read BOOL as their visual-state selector when the second BOOL
         // enables that state. Keep the update block in wire order.
         const bool ee_state[5] = {
@@ -10024,6 +12155,9 @@ bool InsertLegacyLiveObjectUpdateBits(
   *bit_cursor = cursor;
   if (inserted_bits != nullptr) {
     *inserted_bits = local_inserted;
+  }
+  if (orientation_bits != nullptr) {
+    *orientation_bits = local_orientation_bits;
   }
   if (door_extra_bits != nullptr) {
     *door_extra_bits = local_door_extra;
@@ -10156,7 +12290,14 @@ void AppendLiveInventoryCursorDiagnostic(
     return;
   }
 
-  std::wstring shape = L"<not-expanded>";
+  std::wstring shape = FormatLegacyLiveInventory0100OpcodeStream(
+      bytes,
+      record_start,
+      safe_record_end,
+      mask);
+  if (shape.empty()) {
+    shape = L"<not-expanded>";
+  }
   if ((mask & ~(kLegacyLiveInventoryRichCategoryMask |
                 kLegacyLiveInventoryLegacyIconListMask)) == 0 &&
       record_start + 7 <= safe_record_end) {
@@ -10258,7 +12399,7 @@ void AppendLiveInventoryCursorDiagnostic(
 }
 
 bool RewriteLegacyLiveObjectUpdateRecords(
-    const BridgeRuntime* runtime,
+    BridgeRuntime* runtime,
     std::vector<unsigned char>* live_bytes,
     std::vector<unsigned char>* fragment_bytes,
     LiveObjectUpdateRewriteResult* result) {
@@ -10498,6 +12639,19 @@ bool RewriteLegacyLiveObjectUpdateRecords(
             bit_cursor += inventory2a00.total_bit_count;
           }
         }
+        if (runtime != nullptr &&
+            runtime->options.packet_dump &&
+            inventory2a00.inventory0200_byte_mask_branch) {
+          LogFormat(
+              L"server->client live inventory 0x2A00 byte-mask branch: offset=%zu id=0x%08X record_len=%zu count=%u feature25_second=%u tail0800=%d bits=%zu",
+              offset,
+              inventory_object_id,
+              record_end - offset,
+              static_cast<unsigned>(inventory2a00.inventory0200_byte_mask_count),
+              inventory2a00.feature25.second_count,
+              inventory2a00.inventory0800_true_tail ? 1 : 0,
+              inventory2a00.total_bit_count);
+        }
         offset = record_end > offset ? record_end : offset + 1;
         continue;
       }
@@ -10621,6 +12775,54 @@ bool RewriteLegacyLiveObjectUpdateRecords(
       continue;
     }
 
+    if (opcode == 'U' && object_type == 5) {
+      size_t creature_update_bit_cursor = bit_cursor;
+      std::wstring identity_rewrite_detail;
+      if (bit_cursor_reliable &&
+          TryRewriteLegacyCreatureUpdateBareSecondIdentityString(
+              live_bytes,
+              offset,
+              record_end,
+              bits,
+              bit_cursor,
+              &creature_update_bit_cursor,
+              &identity_rewrite_detail)) {
+        bit_cursor = creature_update_bit_cursor;
+        rewritten = true;
+        if (result != nullptr) {
+          uint32_t creature_object_id = 0;
+          uint32_t creature_mask = 0;
+          (void)TryReadU32LeFromBytes(*live_bytes, offset + 2, &creature_object_id);
+          (void)TryReadU32LeFromBytes(*live_bytes, offset + 6, &creature_mask);
+          std::wstring action = L"creature-identity-bare-second-string ";
+          action += identity_rewrite_detail;
+          AppendLiveObjectRewriteDetail(
+              result,
+              offset,
+              object_type,
+              creature_object_id,
+              creature_mask,
+              creature_mask,
+              0,
+              0,
+              0,
+              action.c_str());
+        }
+      } else if (bit_cursor_reliable &&
+                 !AdvanceKnownLegacyLiveCreatureBitCursor(
+                     *live_bytes,
+                     offset,
+                     record_end,
+                     bits,
+                     &creature_update_bit_cursor)) {
+        bit_cursor_reliable = false;
+      } else if (bit_cursor_reliable) {
+        bit_cursor = creature_update_bit_cursor;
+      }
+      offset = record_end > offset ? record_end : offset + 1;
+      continue;
+    }
+
     if (opcode == 'A' && (object_type == 9 || object_type == 10)) {
       std::wstring skip_reason;
       if (ShouldSkipLegacyLiveShortAddRecordBytes(
@@ -10731,10 +12933,89 @@ bool RewriteLegacyLiveObjectUpdateRecords(
           ? L"door-state-only-empty-read-buffer-update"
           : L"placeable-state-only-empty-read-buffer-update";
     }
+
+    LegacyLiveNamedUpdateTail legacy_named_update_tail{};
+    uint16_t ee_orientation_scalar12 = 0;
+    bool legacy_named_update_tail_ready = false;
+    std::wstring legacy_named_update_tail_probe;
+    if (!empty_read_buffer_update &&
+        (object_type == 9 || object_type == 10) &&
+        (raw_mask & kLegacyLiveObjectUpdateNameMask) != 0) {
+      const size_t legacy_tail_offset =
+          DoorPlaceableUpdateNameCursor(offset, raw_mask);
+      if (legacy_tail_offset <= record_end &&
+          record_end - legacy_tail_offset >= 9) {
+        LegacyLiveNamedUpdateTail candidate_tail{};
+        std::wstring tail_rejection;
+        if (TryReadAnchoredLegacyLiveNamedUpdateTail9(
+                *live_bytes,
+                legacy_tail_offset,
+                &candidate_tail,
+                &tail_rejection)) {
+          if (LegacyLiveNamedUpdateTailFollowingPayloadReady(
+                  *live_bytes,
+                  legacy_tail_offset,
+                  record_end)) {
+            legacy_named_update_tail = candidate_tail;
+            legacy_named_update_tail_ready = true;
+            if ((raw_mask & kLegacyLiveObjectUpdateOrientationMask) != 0) {
+              translated_mask |= kLegacyLiveObjectUpdateOrientationMask;
+              ee_orientation_scalar12 =
+                  EncodeEeScalarOrientationFromLegacyFacing(
+                      legacy_named_update_tail.facing);
+            }
+            if ((raw_mask & kLegacyLiveObjectUpdateScaleStateMask) != 0) {
+              translated_mask |= kLegacyLiveObjectUpdateScaleStateMask;
+            }
+            reason = object_type == 10
+                ? L"door-position-orientation-scale-state-name"
+                : L"placeable-position-orientation-scale-state-name";
+          } else {
+            legacy_named_update_tail_probe =
+                FormatLegacyLiveNamedUpdateTailProbe(
+                    *live_bytes,
+                    legacy_tail_offset,
+                    record_end,
+                    &candidate_tail,
+                    L"reject-name-payload");
+          }
+        } else {
+          wchar_t status[160]{};
+          swprintf_s(
+              status,
+              L"reject-%s",
+              tail_rejection.empty() ? L"unknown" : tail_rejection.c_str());
+          legacy_named_update_tail_probe =
+              FormatLegacyLiveNamedUpdateTailProbe(
+                  *live_bytes,
+                  legacy_tail_offset,
+                  record_end,
+                  nullptr,
+                  status);
+        }
+      } else {
+        wchar_t status[96]{};
+        swprintf_s(
+            status,
+            L"reject-tail-too-short remaining=%zu",
+            legacy_tail_offset <= record_end ? record_end - legacy_tail_offset : 0);
+        legacy_named_update_tail_probe =
+            FormatLegacyLiveNamedUpdateTailProbe(
+                *live_bytes,
+                legacy_tail_offset,
+                record_end,
+                nullptr,
+                status);
+      }
+    }
+
+    const bool legacy_name_payload_ready =
+        LegacyLiveUpdateNamePayloadReady(*live_bytes, offset, record_end);
     size_t bad_name_flatten_offset = SIZE_MAX;
     const bool bad_name_payload_recoverable =
         (translated_mask & kLegacyLiveObjectUpdateNameMask) != 0 &&
-        !LegacyLiveUpdateNamePayloadReady(*live_bytes, offset, record_end) &&
+        !legacy_named_update_tail_ready &&
+        !legacy_name_payload_ready &&
         CanFlattenLegacyLiveBadUpdateNamePayload(
             *live_bytes,
             object_type,
@@ -10744,7 +13025,8 @@ bool RewriteLegacyLiveObjectUpdateRecords(
             &bad_name_flatten_offset);
     bool name_payload_ready =
         (translated_mask & kLegacyLiveObjectUpdateNameMask) == 0 ||
-        LegacyLiveUpdateNamePayloadReady(*live_bytes, offset, record_end) ||
+        legacy_named_update_tail_ready ||
+        legacy_name_payload_ready ||
         bad_name_payload_recoverable;
     bool state_only_unanchored_update = false;
     if (!empty_read_buffer_update &&
@@ -10769,6 +13051,8 @@ bool RewriteLegacyLiveObjectUpdateRecords(
          (translated_mask & kLegacyLiveObjectUpdatePositionMask) != 0) ||
         ((object_type == 9 || object_type == 10) &&
          (translated_mask & (kLegacyLiveObjectUpdatePositionMask |
+                             kLegacyLiveObjectUpdateOrientationMask |
+                             kLegacyLiveObjectUpdateScaleStateMask |
                              kLegacyLiveObjectUpdateStateMask |
                              kLegacyLiveObjectUpdateNameMask)) != 0);
     if (update_bits_present) {
@@ -10787,6 +13071,7 @@ bool RewriteLegacyLiveObjectUpdateRecords(
 
     uint32_t removed_this_record = 0;
     uint32_t inserted_this_record = 0;
+    uint32_t orientation_bits_this_record = 0;
     uint32_t door_extra_bits_this_record = 0;
     uint32_t name_mode_bits_this_record = 0;
     uint32_t placeable_state_bits_remapped_this_record = 0;
@@ -10813,6 +13098,41 @@ bool RewriteLegacyLiveObjectUpdateRecords(
     } else {
       size_t name_offset = SIZE_MAX;
       size_t name_end = SIZE_MAX;
+      const auto replace_legacy_named_tail =
+          [&](size_t tail_offset, size_t* tail_bytes_written) -> bool {
+        if (tail_bytes_written != nullptr) {
+          *tail_bytes_written = 0;
+        }
+        if (!legacy_named_update_tail_ready ||
+            tail_offset > live_bytes->size() ||
+            live_bytes->size() - tail_offset < 9) {
+          return false;
+        }
+        uint16_t scalar12 = 0;
+        std::vector<unsigned char> ee_tail =
+            BuildEeDoorPlaceableGenericUpdateBytes(
+                legacy_named_update_tail,
+                translated_mask,
+                &scalar12);
+        if ((translated_mask & kLegacyLiveObjectUpdateOrientationMask) != 0) {
+          ee_orientation_scalar12 = scalar12;
+        }
+        live_bytes->erase(
+            live_bytes->begin() + static_cast<std::ptrdiff_t>(tail_offset),
+            live_bytes->begin() + static_cast<std::ptrdiff_t>(tail_offset + 9));
+        live_bytes->insert(
+            live_bytes->begin() + static_cast<std::ptrdiff_t>(tail_offset),
+            ee_tail.begin(),
+            ee_tail.end());
+        if (tail_bytes_written != nullptr) {
+          *tail_bytes_written = ee_tail.size();
+        }
+        if (ee_tail.size() < 9) {
+          removed_this_record += static_cast<uint32_t>(9 - ee_tail.size());
+        }
+        record_end = record_end - 9 + ee_tail.size();
+        return true;
+      };
       if (state_only_unanchored_update) {
         const size_t erase_begin = offset + 10;
         if (record_end > erase_begin) {
@@ -10825,7 +13145,45 @@ bool RewriteLegacyLiveObjectUpdateRecords(
       } else {
         const size_t expected_name_tail_offset =
             DoorPlaceableUpdateNameCursor(offset, raw_mask);
-        if (FindInlineLiveObjectNameEndingNear(
+        bool recovered_empty_inline_update_name = false;
+        size_t fallback_tail_offset = SIZE_MAX;
+        size_t fallback_length_offset = SIZE_MAX;
+        size_t fallback_text_start = SIZE_MAX;
+        size_t fallback_text_end = SIZE_MAX;
+        if (TryRecoverLegacyLiveUpdateEmptyInlineFallbackName(
+                *live_bytes,
+                object_type,
+                offset,
+                record_end,
+                raw_mask,
+                &fallback_tail_offset,
+                &fallback_length_offset,
+                &fallback_text_start,
+                &fallback_text_end) &&
+            fallback_tail_offset == expected_name_tail_offset &&
+            fallback_length_offset == fallback_tail_offset + 9 &&
+            fallback_text_end > fallback_text_start &&
+            fallback_tail_offset <= record_end &&
+            fallback_length_offset <= record_end &&
+            fallback_text_end <= record_end) {
+          const size_t fallback_name_length =
+              fallback_text_end - fallback_text_start;
+          if (fallback_name_length <= UINT32_MAX) {
+            size_t ee_tail_bytes = 0;
+            if (!replace_legacy_named_tail(fallback_tail_offset, &ee_tail_bytes)) {
+              bit_cursor_reliable = false;
+              offset = record_end > offset ? record_end : offset + 1;
+              continue;
+            }
+            WriteU32Le(
+                live_bytes->data() + fallback_tail_offset + ee_tail_bytes,
+                static_cast<uint32_t>(fallback_name_length));
+            recovered_empty_inline_update_name = true;
+            reason = object_type == 10
+                ? L"door-orientation-scale-state-name+empty-inline-name-length"
+                : L"placeable-orientation-scale-state-name+empty-inline-name-length";
+          }
+        } else if (FindInlineLiveObjectNameEndingNear(
                 *live_bytes,
                 offset,
                 record_end,
@@ -10834,15 +13192,20 @@ bool RewriteLegacyLiveObjectUpdateRecords(
             name_offset >= offset + 19 &&
             name_offset >= 9 &&
             name_offset - 9 == expected_name_tail_offset &&
-            LooksLikeLegacyLiveNamedUpdateTail9(*live_bytes, name_offset - 9)) {
+            legacy_named_update_tail_ready) {
           const size_t erase_begin = name_offset - 9;
-          live_bytes->erase(
-              live_bytes->begin() + static_cast<std::ptrdiff_t>(erase_begin),
-              live_bytes->begin() + static_cast<std::ptrdiff_t>(name_offset));
-          removed_this_record += 9;
-          record_end -= 9;
-          name_offset -= 9;
-          name_end -= 9;
+          size_t ee_tail_bytes = 0;
+          if (!replace_legacy_named_tail(erase_begin, &ee_tail_bytes)) {
+            bit_cursor_reliable = false;
+            offset = record_end > offset ? record_end : offset + 1;
+            continue;
+          }
+          const std::ptrdiff_t delta =
+              static_cast<std::ptrdiff_t>(ee_tail_bytes) - 9;
+          name_offset = static_cast<size_t>(
+              static_cast<std::ptrdiff_t>(name_offset) + delta);
+          name_end = static_cast<size_t>(
+              static_cast<std::ptrdiff_t>(name_end) + delta);
         } else if (FindLegacyLiveUpdateShortNameEndingNear(
                 *live_bytes,
                 offset,
@@ -10852,20 +13215,26 @@ bool RewriteLegacyLiveObjectUpdateRecords(
             name_offset >= offset + 19 &&
             name_offset >= 9 &&
             name_offset - 9 == expected_name_tail_offset &&
-            LooksLikeLegacyLiveNamedUpdateTail9(*live_bytes, name_offset - 9)) {
+            legacy_named_update_tail_ready) {
           const size_t erase_begin = name_offset - 9;
-          live_bytes->erase(
-              live_bytes->begin() + static_cast<std::ptrdiff_t>(erase_begin),
-              live_bytes->begin() + static_cast<std::ptrdiff_t>(name_offset));
-          removed_this_record += 9;
-          record_end -= 9;
-          name_offset -= 9;
-          name_end -= 9;
+          size_t ee_tail_bytes = 0;
+          if (!replace_legacy_named_tail(erase_begin, &ee_tail_bytes)) {
+            bit_cursor_reliable = false;
+            offset = record_end > offset ? record_end : offset + 1;
+            continue;
+          }
+          const std::ptrdiff_t delta =
+              static_cast<std::ptrdiff_t>(ee_tail_bytes) - 9;
+          name_offset = static_cast<size_t>(
+              static_cast<std::ptrdiff_t>(name_offset) + delta);
+          name_end = static_cast<size_t>(
+              static_cast<std::ptrdiff_t>(name_end) + delta);
           WriteU32Le(live_bytes->data() + name_offset, 0);
           ++flattened_names_this_record;
         }
 
         if (flattened_names_this_record == 0 &&
+            !recovered_empty_inline_update_name &&
             bad_name_payload_recoverable &&
             bad_name_flatten_offset != SIZE_MAX &&
             bad_name_flatten_offset <= record_end &&
@@ -10918,6 +13287,7 @@ bool RewriteLegacyLiveObjectUpdateRecords(
         }
 
         if ((translated_mask & kLegacyLiveObjectUpdateNameMask) == 0 &&
+            (translated_mask & kLegacyLiveObjectUpdateScaleStateMask) == 0 &&
             record_end >= offset + 16 &&
             LooksLikeLegacyLiveScalarTail6(*live_bytes, record_end - 6)) {
           live_bytes->erase(
@@ -10930,6 +13300,7 @@ bool RewriteLegacyLiveObjectUpdateRecords(
 
       if (!state_only_unanchored_update &&
           (translated_mask & kLegacyLiveObjectUpdateNameMask) == 0 &&
+          (translated_mask & kLegacyLiveObjectUpdateScaleStateMask) == 0 &&
           record_end >= offset + 16 &&
           LooksLikeLegacyLiveScalarTail6(*live_bytes, record_end - 6)) {
         live_bytes->erase(
@@ -10990,9 +13361,11 @@ bool RewriteLegacyLiveObjectUpdateRecords(
       if (!InsertLegacyLiveObjectUpdateBits(
               object_type,
               translated_mask,
+              ee_orientation_scalar12,
               &bits,
               &bit_cursor,
               &inserted_this_record,
+              &orientation_bits_this_record,
               &door_extra_bits_this_record,
               &name_mode_bits_this_record,
               &placeable_state_bits_remapped_this_record)) {
@@ -11030,6 +13403,7 @@ bool RewriteLegacyLiveObjectUpdateRecords(
       const wchar_t* detail_reason = reason;
       std::wstring detail_reason_text;
       if (position_bits_removed_this_record != 0 ||
+          orientation_bits_this_record != 0 ||
           placeable_state_bits_remapped_this_record != 0) {
         detail_reason_text = reason != nullptr ? reason : L"";
         const auto append_numeric_reason =
@@ -11049,6 +13423,11 @@ bool RewriteLegacyLiveObjectUpdateRecords(
           append_numeric_reason(
               L"position-bits-removed",
               position_bits_removed_this_record);
+        }
+        if (orientation_bits_this_record != 0) {
+          append_numeric_reason(
+              L"orientation-bits",
+              orientation_bits_this_record);
         }
         if (placeable_state_bits_remapped_this_record != 0) {
           append_numeric_reason(
@@ -11071,6 +13450,7 @@ bool RewriteLegacyLiveObjectUpdateRecords(
       if (object_type == 9 || object_type == 10) {
         AppendLiveUpdateRecordRewriteDiagnostic(
             result,
+            runtime,
             *live_bytes,
             offset,
             record_end,
@@ -11086,6 +13466,9 @@ bool RewriteLegacyLiveObjectUpdateRecords(
             flattened_names_this_record,
             update_bits_before.empty() ? bits : update_bits_before,
             bits,
+            legacy_named_update_tail_ready ? &legacy_named_update_tail : nullptr,
+            legacy_named_update_tail_ready,
+            legacy_named_update_tail_probe.c_str(),
             detail_reason);
       }
     }
@@ -11373,6 +13756,28 @@ size_t LegacyItemAppearanceReadSize(int model_type) {
   }
 }
 
+size_t ItemAppearanceModelPartCount(int model_type) {
+  switch (model_type) {
+    case 0:
+    case 1:
+      return 1;
+    case 2:
+      return 3;
+    case 3:
+      return 19;
+    default:
+      return 0;
+  }
+}
+
+bool ItemAppearanceHasColorFields(int model_type) {
+  return model_type == 1 || model_type == 3;
+}
+
+bool ItemAppearanceHasModelType2ExtraByte(int model_type) {
+  return model_type == 2;
+}
+
 void AppendU16Le(std::vector<unsigned char>* bytes, uint16_t value) {
   if (bytes == nullptr) {
     return;
@@ -11450,6 +13855,114 @@ bool BuildEeItemAppearanceReadBufferBytes(
     AppendEeLiveVisualTransformIdentityMap(out);
   }
   return cursor == offset + legacy_size;
+}
+
+bool BuildEeItemAppearanceReadBufferBytesFromLegacyWireShape(
+    const std::vector<unsigned char>& bytes,
+    size_t offset,
+    int ee_model_type,
+    int wire_model_type,
+    bool expand_word_parts,
+    bool append_empty_visual_transform_map,
+    std::vector<unsigned char>* out,
+    uint32_t* synthesized_bytes) {
+  if (out != nullptr) {
+    out->clear();
+  }
+  if (synthesized_bytes != nullptr) {
+    *synthesized_bytes = 0;
+  }
+
+  const size_t wire_size = LegacyItemAppearanceReadSize(wire_model_type);
+  const size_t ee_parts = ItemAppearanceModelPartCount(ee_model_type);
+  const size_t wire_parts = ItemAppearanceModelPartCount(wire_model_type);
+  if (out == nullptr ||
+      wire_size == 0 ||
+      ee_parts == 0 ||
+      wire_parts == 0 ||
+      offset > bytes.size() ||
+      bytes.size() - offset < wire_size) {
+    return false;
+  }
+
+  uint32_t synthesized = 0;
+  auto append_synthesized_part = [&]() {
+    if (expand_word_parts) {
+      AppendU16Le(out, 0);
+      synthesized += 2;
+    } else {
+      out->push_back(0);
+      ++synthesized;
+    }
+  };
+
+  out->insert(out->end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+      bytes.begin() + static_cast<std::ptrdiff_t>(offset + 4));
+  size_t cursor = offset + 4;
+  const size_t copied_parts = std::min(ee_parts, wire_parts);
+  for (size_t index = 0; index < copied_parts; ++index) {
+    if (expand_word_parts) {
+      AppendU16Le(out, bytes[cursor++]);
+    } else {
+      out->push_back(bytes[cursor++]);
+    }
+  }
+  for (size_t index = copied_parts; index < ee_parts; ++index) {
+    append_synthesized_part();
+  }
+  if (wire_parts > copied_parts) {
+    cursor += wire_parts - copied_parts;
+  }
+
+  if (ItemAppearanceHasColorFields(ee_model_type)) {
+    if (ItemAppearanceHasColorFields(wire_model_type)) {
+      if (bytes.size() - cursor < 6) {
+        return false;
+      }
+      out->insert(out->end(),
+          bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
+          bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 6));
+      cursor += 6;
+    } else {
+      out->insert(out->end(), 6, 0);
+      synthesized += 6;
+    }
+  } else if (ItemAppearanceHasColorFields(wire_model_type)) {
+    if (bytes.size() - cursor < 6) {
+      return false;
+    }
+    cursor += 6;
+  }
+
+  if (ee_model_type == 3) {
+    out->insert(out->end(), kEeLiveExtendedArmorTableBytes, 0);
+    synthesized += static_cast<uint32_t>(kEeLiveExtendedArmorTableBytes);
+  }
+
+  if (ItemAppearanceHasModelType2ExtraByte(ee_model_type)) {
+    if (ItemAppearanceHasModelType2ExtraByte(wire_model_type)) {
+      if (cursor >= bytes.size()) {
+        return false;
+      }
+      out->push_back(bytes[cursor++]);
+    } else {
+      out->push_back(0);
+      ++synthesized;
+    }
+  } else if (ItemAppearanceHasModelType2ExtraByte(wire_model_type)) {
+    if (cursor >= bytes.size()) {
+      return false;
+    }
+    ++cursor;
+  }
+
+  if (append_empty_visual_transform_map) {
+    AppendEeLiveVisualTransformIdentityMap(out);
+  }
+  if (synthesized_bytes != nullptr) {
+    *synthesized_bytes = synthesized;
+  }
+  return cursor == offset + wire_size;
 }
 
 bool ReadLegacyLiveFragmentBool(
@@ -11729,6 +14242,134 @@ bool TryFindLegacyActiveEmptyInlineFallbackName(
   return false;
 }
 
+bool TryFindLegacyActiveOverlongInlineName(
+    const std::vector<unsigned char>& bytes,
+    size_t active_offset,
+    size_t read_end,
+    uint32_t base_item_id,
+    bool require_exact_end,
+    size_t* name_length_offset,
+    size_t* text_start,
+    size_t* text_end,
+    size_t* active_end,
+    std::string* preview,
+    size_t* trimmed_bytes) {
+  if (name_length_offset != nullptr) {
+    *name_length_offset = active_offset;
+  }
+  if (text_start != nullptr) {
+    *text_start = active_offset;
+  }
+  if (text_end != nullptr) {
+    *text_end = active_offset;
+  }
+  if (active_end != nullptr) {
+    *active_end = active_offset;
+  }
+  if (preview != nullptr) {
+    preview->clear();
+  }
+  if (trimmed_bytes != nullptr) {
+    *trimmed_bytes = 0;
+  }
+  if (read_end > bytes.size() || active_offset > read_end) {
+    return false;
+  }
+
+  size_t name_offset = active_offset;
+  if (base_item_id == 0x10u) {
+    if (read_end - name_offset < 2) {
+      return false;
+    }
+    name_offset += 2;
+  }
+  if (read_end - name_offset < 4 + 2 + 9) {
+    return false;
+  }
+
+  const uint32_t encoded_length = ReadU32Le(bytes.data() + name_offset);
+  constexpr uint32_t kMaxLegacyOverlongActiveItemNameBytes = 1024;
+  if (encoded_length < 2 ||
+      encoded_length > kMaxLegacyOverlongActiveItemNameBytes ||
+      read_end - name_offset - 4 < encoded_length) {
+    return false;
+  }
+
+  const size_t candidate_text_start = name_offset + 4;
+  const size_t encoded_text_end =
+      candidate_text_start + static_cast<size_t>(encoded_length);
+  const auto is_accepted_tail = [&](size_t tail_end) -> bool {
+    if (require_exact_end) {
+      return tail_end == read_end;
+    }
+    return tail_end == read_end ||
+        LooksLikeLegacyLiveObjectSubMessageBoundaryBytes(bytes, tail_end);
+  };
+
+  size_t normal_active_end = 0;
+  if (TryAdvanceLegacyActiveItemPropertiesByteTail(
+          bytes,
+          encoded_text_end,
+          read_end,
+          &normal_active_end) &&
+      is_accepted_tail(normal_active_end)) {
+    return false;
+  }
+
+  const size_t max_trim = std::min<size_t>(4, encoded_length - 1);
+  for (size_t trim = 1; trim <= max_trim; ++trim) {
+    const size_t candidate_text_end = encoded_text_end - trim;
+    if (candidate_text_end <= candidate_text_start) {
+      continue;
+    }
+
+    bool printable = true;
+    for (size_t cursor = candidate_text_start; cursor < candidate_text_end; ++cursor) {
+      if (!IsLegacyBareActiveItemNameByte(bytes[cursor])) {
+        printable = false;
+        break;
+      }
+    }
+    if (!printable) {
+      continue;
+    }
+
+    size_t candidate_active_end = 0;
+    if (!TryAdvanceLegacyActiveItemPropertiesByteTail(
+            bytes,
+            candidate_text_end,
+            read_end,
+            &candidate_active_end) ||
+        !is_accepted_tail(candidate_active_end)) {
+      continue;
+    }
+
+    if (name_length_offset != nullptr) {
+      *name_length_offset = name_offset;
+    }
+    if (text_start != nullptr) {
+      *text_start = candidate_text_start;
+    }
+    if (text_end != nullptr) {
+      *text_end = candidate_text_end;
+    }
+    if (active_end != nullptr) {
+      *active_end = candidate_active_end;
+    }
+    if (preview != nullptr) {
+      preview->assign(
+          reinterpret_cast<const char*>(bytes.data() + candidate_text_start),
+          reinterpret_cast<const char*>(bytes.data() + candidate_text_end));
+    }
+    if (trimmed_bytes != nullptr) {
+      *trimmed_bytes = trim;
+    }
+    return true;
+  }
+
+  return false;
+}
+
 bool CollectLegacyActiveItemPropertiesByteEnds(
     const std::vector<unsigned char>& bytes,
     size_t active_offset,
@@ -11796,6 +14437,22 @@ bool CollectLegacyActiveItemPropertiesByteEnds(
           nullptr)) {
     AppendUniqueSizeT(active_ends, bare_name_active_end);
   }
+
+  size_t overlong_name_active_end = 0;
+  if (TryFindLegacyActiveOverlongInlineName(
+          bytes,
+          active_offset,
+          read_end,
+          base_item_id,
+          false,
+          nullptr,
+          nullptr,
+          nullptr,
+          &overlong_name_active_end,
+          nullptr,
+          nullptr)) {
+    AppendUniqueSizeT(active_ends, overlong_name_active_end);
+  }
   return !active_ends->empty();
 }
 
@@ -11823,19 +14480,51 @@ bool TryGetLegacyLiveGuiItemCreateBodyShape(
 
   const uint32_t base_item_id = ReadU32Le(bytes.data() + appearance_offset);
 
-  std::vector<int> model_type_candidates;
+  struct ModelShapeCandidate {
+    int ee_model_type = -1;
+    int wire_model_type = -1;
+  };
+  std::vector<ModelShapeCandidate> model_type_candidates;
+  const auto add_model_candidate = [&](int ee_model_type, int wire_model_type) {
+    if (LegacyItemAppearanceReadSize(ee_model_type) == 0 ||
+        LegacyItemAppearanceReadSize(wire_model_type) == 0) {
+      return;
+    }
+    for (const ModelShapeCandidate& existing : model_type_candidates) {
+      if (existing.ee_model_type == ee_model_type &&
+          existing.wire_model_type == wire_model_type) {
+        return;
+      }
+    }
+    model_type_candidates.push_back({ee_model_type, wire_model_type});
+  };
   const int known_model_type =
       runtime != nullptr ? GetBaseItemModelType(*runtime, base_item_id) : -1;
   if (known_model_type >= 0) {
-    model_type_candidates.push_back(known_model_type);
+    add_model_candidate(known_model_type, known_model_type);
+    const size_t known_size = LegacyItemAppearanceReadSize(known_model_type);
+    for (int compact_wire_model_type : {0, 1, 2, 3}) {
+      const size_t compact_size = LegacyItemAppearanceReadSize(compact_wire_model_type);
+      if (compact_wire_model_type != known_model_type &&
+          compact_size != 0 &&
+          known_size != 0 &&
+          compact_size < known_size) {
+        add_model_candidate(known_model_type, compact_wire_model_type);
+      }
+    }
   } else {
-    model_type_candidates = {0, 1, 2, 3};
+    add_model_candidate(0, 0);
+    add_model_candidate(1, 1);
+    add_model_candidate(2, 2);
+    add_model_candidate(3, 3);
   }
 
   LegacyGuiInventoryAddShape best_shape;
   bool have_best = false;
-  for (int model_type : model_type_candidates) {
-    const size_t legacy_size = LegacyItemAppearanceReadSize(model_type);
+  for (const ModelShapeCandidate& model_candidate : model_type_candidates) {
+    const int ee_model_type = model_candidate.ee_model_type;
+    const int wire_model_type = model_candidate.wire_model_type;
+    const size_t legacy_size = LegacyItemAppearanceReadSize(wire_model_type);
     if (legacy_size == 0 ||
         appearance_offset > scan_end ||
         legacy_size > scan_end - appearance_offset) {
@@ -11845,7 +14534,7 @@ bool TryGetLegacyLiveGuiItemCreateBodyShape(
     std::vector<size_t> active_offsets;
     const size_t legacy_end = appearance_offset + legacy_size;
     AppendUniqueSizeT(&active_offsets, legacy_end);
-    if (model_type == 3 &&
+    if (wire_model_type == 3 &&
         HasZeroByteRunAt(bytes, legacy_end, kEeLiveExtendedArmorTableBytes, scan_end)) {
       AppendUniqueSizeT(&active_offsets, legacy_end + kEeLiveExtendedArmorTableBytes);
       if (HasEeIdentityVisualTransformMapBytesAt(
@@ -11886,15 +14575,22 @@ bool TryGetLegacyLiveGuiItemCreateBodyShape(
         candidate.inventory_field = inventory_field;
         candidate.object_id = object_id;
         candidate.base_item_id = base_item_id;
-        candidate.model_type = model_type;
+        candidate.model_type = ee_model_type;
+        candidate.wire_model_type = wire_model_type;
         candidate.appearance_offset = appearance_offset;
         candidate.legacy_appearance_end = legacy_end;
         candidate.active_offset = active_offset;
         candidate.record_end = active_end;
+        candidate.compact_appearance_expansion =
+            ee_model_type != wire_model_type;
         if (!have_best ||
-            candidate.record_end < best_shape.record_end ||
-            (candidate.record_end == best_shape.record_end &&
-             candidate.active_offset > best_shape.active_offset)) {
+            (!candidate.compact_appearance_expansion &&
+             best_shape.compact_appearance_expansion) ||
+            (candidate.compact_appearance_expansion ==
+                 best_shape.compact_appearance_expansion &&
+             (candidate.record_end < best_shape.record_end ||
+              (candidate.record_end == best_shape.record_end &&
+               candidate.active_offset > best_shape.active_offset)))) {
           best_shape = candidate;
           have_best = true;
         }
@@ -12190,6 +14886,10 @@ bool CopyLegacyLiveCreaturePActiveItemPropertiesForEe(
     size_t fallback_name_length_offset = 0;
     size_t fallback_name_text_start = 0;
     size_t fallback_name_text_end = 0;
+    bool rewrite_overlong_inline_name = false;
+    size_t overlong_name_length_offset = 0;
+    size_t overlong_name_text_start = 0;
+    size_t overlong_name_text_end = 0;
   };
 
   constexpr int kUseExistingActiveNameBit = -1;
@@ -12219,6 +14919,10 @@ bool CopyLegacyLiveCreaturePActiveItemPropertiesForEe(
     result->fallback_name_length_offset = 0;
     result->fallback_name_text_start = 0;
     result->fallback_name_text_end = 0;
+    result->rewrite_overlong_inline_name = false;
+    result->overlong_name_length_offset = 0;
+    result->overlong_name_text_start = 0;
+    result->overlong_name_text_end = 0;
 
     const auto fail = [&](const wchar_t* reason) -> bool {
       result->failure_reason = reason;
@@ -12350,6 +15054,10 @@ bool CopyLegacyLiveCreaturePActiveItemPropertiesForEe(
     result->fallback_name_length_offset = 0;
     result->fallback_name_text_start = 0;
     result->fallback_name_text_end = 0;
+    result->rewrite_overlong_inline_name = false;
+    result->overlong_name_length_offset = 0;
+    result->overlong_name_text_start = 0;
+    result->overlong_name_text_end = 0;
 
     const auto fail = [&](const wchar_t* reason) -> bool {
       result->failure_reason = reason;
@@ -12444,6 +15152,122 @@ bool CopyLegacyLiveCreaturePActiveItemPropertiesForEe(
     return true;
   };
 
+  const auto parse_overlong_inline_name_attempt =
+      [&](ActiveParseAttempt* result) -> bool {
+    if (result == nullptr) {
+      return false;
+    }
+    result->bits = *fragment_bits;
+    result->bit_cursor = original_bit_cursor;
+    result->cursor = active_offset;
+    result->inserted_bits = 0;
+    result->name_preview.clear();
+    result->failure_reason.clear();
+    result->rewrite_empty_inline_fallback_name = false;
+    result->fallback_name_length_offset = 0;
+    result->fallback_name_text_start = 0;
+    result->fallback_name_text_end = 0;
+    result->rewrite_overlong_inline_name = false;
+    result->overlong_name_length_offset = 0;
+    result->overlong_name_text_start = 0;
+    result->overlong_name_text_end = 0;
+
+    const auto fail = [&](const wchar_t* reason) -> bool {
+      result->failure_reason = reason;
+      return false;
+    };
+
+    size_t name_length_offset = 0;
+    size_t text_start = 0;
+    size_t text_end = 0;
+    size_t parsed_active_end = 0;
+    size_t trimmed_bytes = 0;
+    std::string overlong_name;
+    if (!TryFindLegacyActiveOverlongInlineName(
+            bytes,
+            active_offset,
+            read_end,
+            base_item_id,
+            true,
+            &name_length_offset,
+            &text_start,
+            &text_end,
+            &parsed_active_end,
+            &overlong_name,
+            &trimmed_bytes) ||
+        trimmed_bytes == 0) {
+      return fail(L"active-properties-overlong-inline-name-shape-missing");
+    }
+
+    const size_t name_bit = result->bit_cursor;
+    if (!SetCnwMsbBit(&result->bits, name_bit, false, nullptr)) {
+      return fail(L"active-properties-overlong-inline-name-bit-set-failed");
+    }
+    bool name_is_locstring = true;
+    if (!ReadLegacyLiveFragmentBool(
+            result->bits,
+            &result->bit_cursor,
+            &name_is_locstring) ||
+        name_is_locstring) {
+      return fail(L"active-properties-overlong-inline-name-bit-invalid");
+    }
+
+    result->cursor = text_end;
+    result->name_preview = overlong_name;
+    result->rewrite_overlong_inline_name = true;
+    result->overlong_name_length_offset = name_length_offset;
+    result->overlong_name_text_start = text_start;
+    result->overlong_name_text_end = text_end;
+
+    if (!AdvanceLegacyLiveFragmentBits(result->bits, &result->bit_cursor, 1) ||
+        read_end - result->cursor < 8) {
+      return fail(L"active-properties-overlong-inline-name-cost-stack-short");
+    }
+    result->cursor += 8;
+
+    if (!AdvanceLegacyLiveFragmentBits(result->bits, &result->bit_cursor, 3)) {
+      return fail(L"active-properties-overlong-inline-name-post-name-bits-short");
+    }
+    if (!InsertCnwMsbBit(&result->bits, result->bit_cursor, false)) {
+      return fail(L"active-properties-overlong-inline-name-ee-extra-bit-insert-failed");
+    }
+    ++result->bit_cursor;
+    ++result->inserted_bits;
+
+    if (read_end - result->cursor < 1) {
+      return fail(L"active-properties-overlong-inline-name-count-short");
+    }
+    const uint8_t property_count = bytes[result->cursor++];
+    constexpr uint8_t kMaxReasonableLiveItemProperties = 128;
+    if (property_count > kMaxReasonableLiveItemProperties) {
+      wchar_t text[128]{};
+      swprintf_s(
+          text,
+          L"active-properties-overlong-inline-name-count-unreasonable=%u",
+          static_cast<unsigned int>(property_count));
+      result->failure_reason = text;
+      return false;
+    }
+    const size_t property_bytes = static_cast<size_t>(property_count) * 7u;
+    if (read_end - result->cursor < property_bytes + 2) {
+      return fail(L"active-properties-overlong-inline-name-table-short");
+    }
+    result->cursor += property_bytes;
+
+    const uint8_t state_mask = bytes[result->cursor++];
+    const uint8_t value_mask = bytes[result->cursor++];
+    (void)state_mask;
+    const size_t value_bytes = CountByteSetBits(value_mask);
+    if (read_end - result->cursor < value_bytes) {
+      return fail(L"active-properties-overlong-inline-name-value-mask-short");
+    }
+    result->cursor += value_bytes;
+    if (result->cursor != parsed_active_end || result->cursor != read_end) {
+      return fail(L"active-properties-overlong-inline-name-end-mismatch");
+    }
+    return true;
+  };
+
   std::vector<std::pair<int, int>> candidates;
   const auto add_candidate = [&](int name_bit, int inner_bit) {
     const std::pair<int, int> candidate{name_bit, inner_bit};
@@ -12498,6 +15322,16 @@ bool CopyLegacyLiveCreaturePActiveItemPropertiesForEe(
   }
 
   if (!parsed) {
+    ActiveParseAttempt attempt;
+    if (parse_overlong_inline_name_attempt(&attempt)) {
+      successful_attempt = std::move(attempt);
+      parsed = true;
+    } else if (first_failure.empty()) {
+      first_failure = attempt.failure_reason;
+    }
+  }
+
+  if (!parsed) {
     if (failure_reason != nullptr) {
       *failure_reason = first_failure.empty()
           ? L"active-properties-parse-failed"
@@ -12516,11 +15350,18 @@ bool CopyLegacyLiveCreaturePActiveItemPropertiesForEe(
   }
   const size_t cursor = successful_attempt.cursor;
 
-  if (successful_attempt.rewrite_empty_inline_fallback_name) {
-    const size_t name_length_offset =
-        successful_attempt.fallback_name_length_offset;
-    const size_t text_start = successful_attempt.fallback_name_text_start;
-    const size_t text_end = successful_attempt.fallback_name_text_end;
+  if (successful_attempt.rewrite_empty_inline_fallback_name ||
+      successful_attempt.rewrite_overlong_inline_name) {
+    const bool overlong_name = successful_attempt.rewrite_overlong_inline_name;
+    const size_t name_length_offset = overlong_name
+        ? successful_attempt.overlong_name_length_offset
+        : successful_attempt.fallback_name_length_offset;
+    const size_t text_start = overlong_name
+        ? successful_attempt.overlong_name_text_start
+        : successful_attempt.fallback_name_text_start;
+    const size_t text_end = overlong_name
+        ? successful_attempt.overlong_name_text_end
+        : successful_attempt.fallback_name_text_end;
     if (active_offset > name_length_offset ||
         name_length_offset > text_start ||
         text_start > text_end ||
@@ -12528,7 +15369,9 @@ bool CopyLegacyLiveCreaturePActiveItemPropertiesForEe(
         text_start - name_length_offset != 4 ||
         text_end - text_start > UINT32_MAX) {
       if (failure_reason != nullptr) {
-        *failure_reason = L"active-properties-empty-inline-fallback-output-invalid";
+        *failure_reason = overlong_name
+            ? L"active-properties-overlong-inline-name-output-invalid"
+            : L"active-properties-empty-inline-fallback-output-invalid";
       }
       return false;
     }
@@ -12572,7 +15415,7 @@ bool RewriteLegacyGuiItemCreateFeatureGateRecord(
     uint32_t* active_property_bits_inserted,
     std::wstring* detail) {
   const wchar_t* safe_label = label != nullptr ? label : L"gui-item-A";
-  const size_t legacy_size = LegacyItemAppearanceReadSize(shape.model_type);
+  const size_t legacy_size = LegacyItemAppearanceReadSize(shape.wire_model_type);
   if (rewritten_record == nullptr ||
       fragment_bits == nullptr ||
       bit_cursor == nullptr ||
@@ -12591,13 +15434,16 @@ bool RewriteLegacyGuiItemCreateFeatureGateRecord(
       runtime.options.rewrite_live_object_item_appearance_word_parts;
 
   std::vector<unsigned char> ee_appearance;
-  if (!BuildEeItemAppearanceReadBufferBytes(
+  uint32_t synthesized_appearance_bytes = 0;
+  if (!BuildEeItemAppearanceReadBufferBytesFromLegacyWireShape(
           bytes,
           shape.appearance_offset,
           shape.model_type,
+          shape.wire_model_type,
           expand_word_parts,
           append_empty_visual_transform_map,
-          &ee_appearance)) {
+          &ee_appearance,
+          &synthesized_appearance_bytes)) {
     return false;
   }
 
@@ -12646,17 +15492,38 @@ bool RewriteLegacyGuiItemCreateFeatureGateRecord(
   if (active_property_bits_inserted != nullptr) {
     *active_property_bits_inserted = active_bits;
   }
+  if (shape.compact_appearance_expansion && runtime.options.packet_dump) {
+    LogFormat(
+        L"server->client GUI item compact appearance expanded: label=%ls offset=%zu inv=%u id=0x%08X base=%u model=%d wire_model=%d wire_bytes=%zu ee_bytes=%zu synth=%u delta=%u active=%zu end=%zu name=%hs",
+        safe_label,
+        record_offset,
+        shape.inventory_field,
+        shape.object_id,
+        shape.base_item_id,
+        shape.model_type,
+        shape.wire_model_type,
+        legacy_size,
+        ee_appearance.size(),
+        synthesized_appearance_bytes,
+        appearance_delta,
+        shape.active_offset,
+        shape.record_end,
+        name_preview.empty() ? "<empty>" : name_preview.c_str());
+  }
   if (detail != nullptr) {
     wchar_t text[512]{};
     swprintf_s(
         text,
-        L"+%zu %ls inv=%u id=0x%08X base=%u model=%d bytes=%u active_bits=%u name=%hs",
+        L"+%zu %ls inv=%u id=0x%08X base=%u model=%d wire_model=%d compact=%d synth=%u bytes=%u active_bits=%u name=%hs",
         record_offset,
         safe_label,
         shape.inventory_field,
         shape.object_id,
         shape.base_item_id,
         shape.model_type,
+        shape.wire_model_type,
+        shape.compact_appearance_expansion ? 1 : 0,
+        synthesized_appearance_bytes,
         appearance_delta,
         active_bits,
         name_preview.empty() ? "<empty>" : name_preview.c_str());
@@ -17591,13 +20458,90 @@ bool LooksLikeLegacyPlaceableAddTailAt(
     size_t record_end,
     size_t* legacy_tail_end);
 
+bool TryFindLegacyPlaceableEmptyInlineFallbackName(
+    const std::vector<unsigned char>& bytes,
+    size_t name_offset,
+    size_t record_end,
+    size_t* length_offset,
+    size_t* text_start,
+    size_t* text_end,
+    size_t* legacy_tail_end) {
+  if (length_offset != nullptr) {
+    *length_offset = name_offset;
+  }
+  if (text_start != nullptr) {
+    *text_start = name_offset;
+  }
+  if (text_end != nullptr) {
+    *text_end = name_offset;
+  }
+  if (legacy_tail_end != nullptr) {
+    *legacy_tail_end = 0;
+  }
+  if (name_offset > record_end ||
+      record_end > bytes.size() ||
+      record_end - name_offset < 4 + 1 + 1 + 2 + 2 ||
+      ReadU32Le(bytes.data() + name_offset) != 0) {
+    return false;
+  }
+
+  size_t empty_tail_end = 0;
+  if (LooksLikeLegacyPlaceableAddTailAt(
+          bytes,
+          name_offset + 4,
+          record_end,
+          &empty_tail_end)) {
+    return false;
+  }
+
+  const size_t candidate_text_start = name_offset + 4;
+  constexpr size_t kMaxLegacyBarePlaceableNameBytes = 128;
+  const size_t candidate_text_limit =
+      std::min(record_end, candidate_text_start + kMaxLegacyBarePlaceableNameBytes);
+  for (size_t candidate_text_end = candidate_text_start + 1;
+       candidate_text_end <= candidate_text_limit;
+       ++candidate_text_end) {
+    if (!IsLegacyBareActiveItemNameByte(bytes[candidate_text_end - 1])) {
+      break;
+    }
+
+    size_t candidate_tail_end = 0;
+    if (!LooksLikeLegacyPlaceableAddTailAt(
+            bytes,
+            candidate_text_end,
+            record_end,
+            &candidate_tail_end)) {
+      continue;
+    }
+
+    if (length_offset != nullptr) {
+      *length_offset = name_offset;
+    }
+    if (text_start != nullptr) {
+      *text_start = candidate_text_start;
+    }
+    if (text_end != nullptr) {
+      *text_end = candidate_text_end;
+    }
+    if (legacy_tail_end != nullptr) {
+      *legacy_tail_end = candidate_tail_end;
+    }
+    return true;
+  }
+
+  return false;
+}
+
 bool TryFindPlaceableAddNameForAddRecordRewrite(
     const std::vector<unsigned char>& bytes,
     size_t record_offset,
     size_t record_end,
     size_t* name_offset,
     size_t* visual_transform_offset,
-    bool* short_locstring) {
+    bool* short_locstring,
+    size_t* fallback_name_length_offset,
+    size_t* fallback_name_text_start,
+    size_t* fallback_name_text_end) {
   if (name_offset != nullptr) {
     *name_offset = 0;
   }
@@ -17606,6 +20550,15 @@ bool TryFindPlaceableAddNameForAddRecordRewrite(
   }
   if (short_locstring != nullptr) {
     *short_locstring = false;
+  }
+  if (fallback_name_length_offset != nullptr) {
+    *fallback_name_length_offset = 0;
+  }
+  if (fallback_name_text_start != nullptr) {
+    *fallback_name_text_start = 0;
+  }
+  if (fallback_name_text_end != nullptr) {
+    *fallback_name_text_end = 0;
   }
   if (record_offset > bytes.size() || record_end > bytes.size() ||
       record_end <= record_offset || bytes.size() - record_offset < 11 ||
@@ -17617,8 +20570,14 @@ bool TryFindPlaceableAddNameForAddRecordRewrite(
   const size_t candidate_name = record_offset + 6;
   size_t candidate_tail = 0;
   size_t inline_end = 0;
+  uint32_t inline_length = 0;
   bool candidate_short = false;
-  if (LooksLikeInlineCExoStringAt(bytes, candidate_name, nullptr, &inline_end, nullptr)) {
+  if (LooksLikeInlineCExoStringAt(
+          bytes,
+          candidate_name,
+          &inline_length,
+          &inline_end,
+          nullptr)) {
     candidate_tail = inline_end;
   } else {
     size_t legacy_tail_end = 0;
@@ -17637,7 +20596,29 @@ bool TryFindPlaceableAddNameForAddRecordRewrite(
 
   size_t legacy_tail_end = 0;
   if (!LooksLikeLegacyPlaceableAddTailAt(bytes, candidate_tail, record_end, &legacy_tail_end)) {
-    return false;
+    size_t recovered_length_offset = 0;
+    size_t recovered_text_start = 0;
+    size_t recovered_text_end = 0;
+    if (inline_length != 0 ||
+        !TryFindLegacyPlaceableEmptyInlineFallbackName(
+            bytes,
+            candidate_name,
+            record_end,
+            &recovered_length_offset,
+            &recovered_text_start,
+            &recovered_text_end,
+            &legacy_tail_end)) {
+      return false;
+    }
+    if (fallback_name_length_offset != nullptr) {
+      *fallback_name_length_offset = recovered_length_offset;
+    }
+    if (fallback_name_text_start != nullptr) {
+      *fallback_name_text_start = recovered_text_start;
+    }
+    if (fallback_name_text_end != nullptr) {
+      *fallback_name_text_end = recovered_text_end;
+    }
   }
   if (name_offset != nullptr) {
     *name_offset = candidate_name;
@@ -17657,44 +20638,59 @@ bool TryReadLegacyTriggerAddShape(
     const std::vector<unsigned char>& bytes,
     size_t record_offset,
     size_t record_end,
-    uint8_t* primary_flag,
+    uint8_t* cursor_byte,
     uint8_t* vertex_count) {
-  if (primary_flag != nullptr) {
-    *primary_flag = 0;
+  if (cursor_byte != nullptr) {
+    *cursor_byte = 0;
   }
   if (vertex_count != nullptr) {
     *vertex_count = 0;
   }
-  constexpr size_t kTriggerReadBufferBytesBeforeVertices = 16;
   constexpr size_t kTriggerVertexBytes = 12;
-  if (record_offset > bytes.size() || record_end > bytes.size() ||
-      bytes.size() - record_offset < kTriggerReadBufferBytesBeforeVertices ||
+  if (record_offset > bytes.size() ||
+      record_end > bytes.size() ||
+      bytes.size() - record_offset < 16 ||
       bytes[record_offset] != 'A' || bytes[record_offset + 1] != 7 ||
-      !LooksLikeLegacyLiveObjectIdAt(bytes, record_offset + 2) ||
-      LooksLikeInlineCExoStringAt(bytes, record_offset + 6, nullptr, nullptr, nullptr)) {
+      !LooksLikeLegacyLiveObjectIdAt(bytes, record_offset + 2)) {
     return false;
   }
 
-  const uint8_t observed_primary = bytes[record_offset + 10];
-  const uint8_t observed_vertices = bytes[record_offset + 15];
+  size_t cursor_offset = record_offset + 10;
+  size_t direct_name_end = 0;
+  if (LooksLikeInlineCExoStringAt(
+          bytes,
+          record_offset + 6,
+          nullptr,
+          &direct_name_end,
+          nullptr) &&
+      direct_name_end <= record_end &&
+      record_end - direct_name_end >= 6) {
+    cursor_offset = direct_name_end;
+  }
+
+  if (cursor_offset > record_end || record_end - cursor_offset < 6) {
+    return false;
+  }
+
+  const uint8_t observed_cursor = bytes[cursor_offset];
+  const uint8_t observed_vertices = bytes[cursor_offset + 5];
   float height = 0.0f;
-  if (observed_primary > 1 ||
-      observed_vertices == 0 ||
+  if (observed_vertices == 0 ||
       observed_vertices > 64 ||
-      !TryReadFloatLeFromBytes(bytes, record_offset + 11, &height) ||
+      !TryReadFloatLeFromBytes(bytes, cursor_offset + 1, &height) ||
       !(height >= -1000.0f && height <= 1000.0f)) {
     return false;
   }
 
   const size_t expected_end =
-      record_offset + kTriggerReadBufferBytesBeforeVertices +
+      cursor_offset + 6 +
       static_cast<size_t>(observed_vertices) * kTriggerVertexBytes;
   if (expected_end != record_end) {
     return false;
   }
   for (uint8_t index = 0; index < observed_vertices; ++index) {
     const size_t vertex_offset =
-        record_offset + kTriggerReadBufferBytesBeforeVertices +
+        cursor_offset + 6 +
         static_cast<size_t>(index) * kTriggerVertexBytes;
     for (size_t component = 0; component < 3; ++component) {
       float value = 0.0f;
@@ -17706,8 +20702,8 @@ bool TryReadLegacyTriggerAddShape(
     }
   }
 
-  if (primary_flag != nullptr) {
-    *primary_flag = observed_primary;
+  if (cursor_byte != nullptr) {
+    *cursor_byte = observed_cursor;
   }
   if (vertex_count != nullptr) {
     *vertex_count = observed_vertices;
@@ -17752,25 +20748,751 @@ std::wstring FormatCnwBitSlice(
   return text;
 }
 
+int CnwBitValueOrUnknown(const std::vector<unsigned char>& bits, size_t index) {
+  if (index >= bits.size()) {
+    return -1;
+  }
+  return bits[index] != 0 ? 1 : 0;
+}
+
+void AppendNamedCnwBit(
+    std::wstring* text,
+    const wchar_t* label,
+    const std::vector<unsigned char>& bits,
+    size_t index) {
+  if (text == nullptr) {
+    return;
+  }
+  if (!text->empty() && text->back() != L'{') {
+    *text += L" ";
+  }
+  *text += label != nullptr ? label : L"?";
+  *text += L"=";
+  const int value = CnwBitValueOrUnknown(bits, index);
+  if (value < 0) {
+    *text += L"?";
+  } else {
+    *text += value != 0 ? L"1" : L"0";
+  }
+  *text += L"@";
+  *text += std::to_wstring(index);
+}
+
+void AppendNamedAbsentBit(std::wstring* text, const wchar_t* label, const wchar_t* reason) {
+  if (text == nullptr) {
+    return;
+  }
+  if (!text->empty() && text->back() != L'{') {
+    *text += L" ";
+  }
+  *text += label != nullptr ? label : L"?";
+  *text += L"=";
+  *text += reason != nullptr ? reason : L"absent";
+}
+
+std::wstring FormatLivePlaceableAddSourceBitMap(
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor,
+    bool short_locstring,
+    bool inline_locstring_name,
+    bool direct_name_mode_repair = false) {
+  const size_t source_shift = (inline_locstring_name && !direct_name_mode_repair) ? 1 : 0;
+  std::wstring text = L"src{";
+  AppendNamedCnwBit(&text, L"name_outer", bits, bit_cursor);
+  if (direct_name_mode_repair) {
+    AppendNamedCnwBit(&text, L"name_inner_as_legacy_10c_visual_selector", bits, bit_cursor + 1);
+  } else if (inline_locstring_name) {
+    AppendNamedCnwBit(&text, L"name_inner_client_tlk", bits, bit_cursor + 1);
+  } else {
+    AppendNamedAbsentBit(
+        &text,
+        L"name_inner_client_tlk",
+        short_locstring ? L"synthetic" : L"absent");
+  }
+  if (!direct_name_mode_repair) {
+    AppendNamedCnwBit(&text, L"legacy_10c_reputation_visual", bits, bit_cursor + 1 + source_shift);
+  }
+  AppendNamedCnwBit(
+      &text,
+      L"legacy_optional_gate_consumed_as_false",
+      bits,
+      bit_cursor + 2 + source_shift);
+  AppendNamedCnwBit(&text, L"legacy_0f8_static_plot", bits, bit_cursor + 3 + source_shift);
+  AppendNamedCnwBit(&text, L"legacy_110_useable", bits, bit_cursor + 4 + source_shift);
+  AppendNamedCnwBit(&text, L"legacy_118_trap_disarmable", bits, bit_cursor + 5 + source_shift);
+  AppendNamedCnwBit(&text, L"legacy_0fc_lockable", bits, bit_cursor + 6 + source_shift);
+  AppendNamedCnwBit(&text, L"legacy_100_locked", bits, bit_cursor + 7 + source_shift);
+  AppendNamedCnwBit(&text, L"legacy_114_unknown_ee_1ac", bits, bit_cursor + 8 + source_shift);
+  AppendNamedCnwBit(&text, L"legacy_108_name_valid", bits, bit_cursor + 9 + source_shift);
+  text += L"}";
+  return text;
+}
+
+std::wstring FormatLivePlaceableNameModeDriftProbe(
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor) {
+  std::wstring text = L"drift_probe{";
+  for (int delta = -2; delta <= 2; ++delta) {
+    if (delta != -2) {
+      text += L" ";
+    }
+    text += L"c";
+    if (delta > 0) {
+      text += L"+";
+    }
+    text += std::to_wstring(delta);
+    text += L":";
+    const int64_t candidate = static_cast<int64_t>(bit_cursor) + delta;
+    if (candidate < 0) {
+      text += L"before-start";
+      continue;
+    }
+    const size_t candidate_cursor = static_cast<size_t>(candidate);
+    AppendNamedCnwBit(&text, L"outer", bits, candidate_cursor);
+    AppendNamedCnwBit(&text, L"inner", bits, candidate_cursor + 1);
+    AppendNamedCnwBit(&text, L"first", bits, candidate_cursor + 2);
+  }
+  text += L"}";
+  return text;
+}
+
+std::wstring FormatLivePlaceableAddDestinationBitMap(
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor,
+    bool short_locstring,
+    bool inline_locstring_name) {
+  const size_t destination_name_inner_bits =
+      (short_locstring || inline_locstring_name) ? 1 : 0;
+  const size_t post_name_bit = bit_cursor + 1 + destination_name_inner_bits;
+  std::wstring text = L"dst{";
+  AppendNamedCnwBit(&text, L"name_outer", bits, bit_cursor);
+  if (destination_name_inner_bits != 0) {
+    AppendNamedCnwBit(&text, L"name_inner_client_tlk", bits, bit_cursor + 1);
+  } else {
+    AppendNamedAbsentBit(&text, L"name_inner_client_tlk", L"absent");
+  }
+  AppendNamedCnwBit(&text, L"ee_1a8_reputation_visual", bits, post_name_bit);
+  AppendNamedCnwBit(
+      &text,
+      L"ee_1bc_bodybag_target",
+      bits,
+      bit_cursor + 2 + destination_name_inner_bits);
+  AppendNamedCnwBit(&text, L"ee_194_static_plot", bits, post_name_bit + 2);
+  AppendNamedCnwBit(&text, L"ee_setuseable_useable", bits, post_name_bit + 3);
+  AppendNamedCnwBit(&text, L"ee_1b0_trap_disarmable", bits, post_name_bit + 4);
+  AppendNamedCnwBit(&text, L"ee_198_lockable", bits, post_name_bit + 5);
+  AppendNamedCnwBit(&text, L"ee_19c_locked", bits, post_name_bit + 6);
+  AppendNamedCnwBit(&text, L"ee_1ac_unknown_4fc", bits, post_name_bit + 7);
+  AppendNamedCnwBit(&text, L"ee_1a4_name_valid", bits, post_name_bit + 8);
+  AppendNamedCnwBit(&text, L"ee_light_is_on", bits, post_name_bit + 9);
+  text += L"}";
+  return text;
+}
+
+LivePlaceableSemanticBits MakeLivePlaceableUpdateDestinationSemanticBits(
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor) {
+  LivePlaceableSemanticBits state;
+  state.known = true;
+  state.visual_selector = CnwBitValueOrUnknown(bits, bit_cursor);
+  state.visual_gate = CnwBitValueOrUnknown(bits, bit_cursor + 1);
+  state.locked = CnwBitValueOrUnknown(bits, bit_cursor + 2);
+  state.lockable = CnwBitValueOrUnknown(bits, bit_cursor + 3);
+  state.visual_payload = CnwBitValueOrUnknown(bits, bit_cursor + 4);
+  return state;
+}
+
+LivePlaceableSemanticBits MakeLivePlaceableAddDestinationSemanticBits(
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor,
+    bool short_locstring,
+    bool inline_locstring_name) {
+  const size_t destination_name_inner_bits =
+      (short_locstring || inline_locstring_name) ? 1 : 0;
+  const size_t post_name_bit = bit_cursor + 1 + destination_name_inner_bits;
+  LivePlaceableSemanticBits state;
+  state.known = true;
+  state.visual_selector = CnwBitValueOrUnknown(bits, post_name_bit);
+  state.static_plot = CnwBitValueOrUnknown(bits, post_name_bit + 2);
+  state.useable = CnwBitValueOrUnknown(bits, post_name_bit + 3);
+  state.trap_disarmable = CnwBitValueOrUnknown(bits, post_name_bit + 4);
+  state.lockable = CnwBitValueOrUnknown(bits, post_name_bit + 5);
+  state.locked = CnwBitValueOrUnknown(bits, post_name_bit + 6);
+  state.unknown_1ac = CnwBitValueOrUnknown(bits, post_name_bit + 7);
+  state.name_valid = CnwBitValueOrUnknown(bits, post_name_bit + 8);
+  state.light_is_on = CnwBitValueOrUnknown(bits, post_name_bit + 9);
+  return state;
+}
+
+const wchar_t* FormatLivePlaceableBitValue(int value) {
+  if (value < 0) {
+    return L"?";
+  }
+  return value != 0 ? L"1" : L"0";
+}
+
+void AppendLivePlaceableCommonDelta(
+    std::wstring* text,
+    const wchar_t* label,
+    int before,
+    int after,
+    bool* any_changed,
+    bool* any_known) {
+  if (text == nullptr || label == nullptr) {
+    return;
+  }
+  if (before < 0 || after < 0) {
+    return;
+  }
+  if (any_known != nullptr) {
+    *any_known = true;
+  }
+  if (before == after) {
+    return;
+  }
+  if (!text->empty() && text->back() != L'{') {
+    *text += L" ";
+  }
+  *text += label;
+  *text += L"=";
+  *text += FormatLivePlaceableBitValue(before);
+  *text += L"->";
+  *text += FormatLivePlaceableBitValue(after);
+  if (any_changed != nullptr) {
+    *any_changed = true;
+  }
+}
+
+std::wstring FormatLivePlaceableAddUpdateDelta(
+    const LivePlaceableSemanticBits& add_state,
+    const LivePlaceableSemanticBits& update_state) {
+  if (!add_state.known) {
+    return L"add-state-unknown";
+  }
+  if (!update_state.known) {
+    return L"update-state-unknown";
+  }
+
+  std::wstring text = L"add_vs_update{";
+  bool any_changed = false;
+  bool any_known = false;
+  AppendLivePlaceableCommonDelta(
+      &text,
+      L"ee_1a8_visual",
+      add_state.visual_selector,
+      update_state.visual_selector,
+      &any_changed,
+      &any_known);
+  AppendLivePlaceableCommonDelta(
+      &text,
+      L"ee_198_lockable",
+      add_state.lockable,
+      update_state.lockable,
+      &any_changed,
+      &any_known);
+  AppendLivePlaceableCommonDelta(
+      &text,
+      L"ee_19c_locked",
+      add_state.locked,
+      update_state.locked,
+      &any_changed,
+      &any_known);
+  if (!any_known) {
+    text += L"no-common-known";
+  } else if (!any_changed) {
+    text += L"common-unchanged";
+  }
+  text += L" update_only[gate=";
+  text += FormatLivePlaceableBitValue(update_state.visual_gate);
+  text += L" payload=";
+  text += FormatLivePlaceableBitValue(update_state.visual_payload);
+  text += L"] add_only[static=";
+  text += FormatLivePlaceableBitValue(add_state.static_plot);
+  text += L" useable=";
+  text += FormatLivePlaceableBitValue(add_state.useable);
+  text += L" trap=";
+  text += FormatLivePlaceableBitValue(add_state.trap_disarmable);
+  text += L" unk1ac=";
+  text += FormatLivePlaceableBitValue(add_state.unknown_1ac);
+  text += L" name_valid=";
+  text += FormatLivePlaceableBitValue(add_state.name_valid);
+  text += L" light=";
+  text += FormatLivePlaceableBitValue(add_state.light_is_on);
+  text += L"]}";
+  return text;
+}
+
+bool ContainsObjectId(const std::vector<uint32_t>& ids, uint32_t object_id) {
+  return std::find(ids.begin(), ids.end(), object_id) != ids.end();
+}
+
+size_t CountAreaPlaceableRowsWithAppearance(
+    const std::vector<AreaPlaceableContextRow>& rows,
+    uint16_t appearance) {
+  return static_cast<size_t>(std::count_if(
+      rows.begin(),
+      rows.end(),
+      [appearance](const AreaPlaceableContextRow& row) {
+        return row.appearance == appearance;
+      }));
+}
+
+size_t CountAreaPlaceableRowsWithAppearanceNear2d(
+    const std::vector<AreaPlaceableContextRow>& rows,
+    uint16_t appearance,
+    float x,
+    float y,
+    double max_distance) {
+  return static_cast<size_t>(std::count_if(
+      rows.begin(),
+      rows.end(),
+      [appearance, x, y, max_distance](const AreaPlaceableContextRow& row) {
+        return row.appearance == appearance &&
+            AreaPositionDistance2d(row, x, y) <= max_distance;
+      }));
+}
+
+LivePlaceableAddContextRow* FindOrCreateLivePlaceableContextRow(
+    BridgeRuntime* runtime,
+    uint32_t object_id) {
+  if (runtime == nullptr) {
+    return nullptr;
+  }
+  auto found = std::find_if(
+      runtime->latest_live_placeable_add_rows.begin(),
+      runtime->latest_live_placeable_add_rows.end(),
+      [object_id](const LivePlaceableAddContextRow& row) {
+        return row.object_id == object_id;
+      });
+  if (found != runtime->latest_live_placeable_add_rows.end()) {
+    return &*found;
+  }
+  if (runtime->latest_live_placeable_add_rows.size() >= 1024) {
+    runtime->latest_live_placeable_add_rows.erase(
+        runtime->latest_live_placeable_add_rows.begin());
+  }
+  LivePlaceableAddContextRow row;
+  row.object_id = object_id;
+  runtime->latest_live_placeable_add_rows.push_back(row);
+  return &runtime->latest_live_placeable_add_rows.back();
+}
+
+std::wstring RememberLivePlaceableAddContext(
+    BridgeRuntime* runtime,
+    uint32_t object_id,
+    uint16_t appearance,
+    const std::string& name,
+    const LivePlaceableSemanticBits& add_state) {
+  if (runtime == nullptr) {
+    return L"state_history=runtime-unavailable";
+  }
+  LivePlaceableAddContextRow* row =
+      FindOrCreateLivePlaceableContextRow(runtime, object_id);
+  if (row == nullptr) {
+    return L"state_history=row-unavailable";
+  }
+
+  std::wstring text = L"state_history{add_state=remembered update_count=";
+  text += std::to_wstring(row->update_count);
+  text += L" pending_update_delta=";
+  text += FormatLivePlaceableAddUpdateDelta(add_state, row->latest_update_state);
+  if (row->latest_update_has_position) {
+    const size_t total_static = CountAreaPlaceableRowsWithAppearance(
+        runtime->latest_area_static_placeable_rows,
+        appearance);
+    const size_t near_static = CountAreaPlaceableRowsWithAppearanceNear2d(
+        runtime->latest_area_static_placeable_rows,
+        appearance,
+        row->latest_update_x,
+        row->latest_update_y,
+        2.0);
+    const size_t total_light = CountAreaPlaceableRowsWithAppearance(
+        runtime->latest_area_placeable_light_rows,
+        appearance);
+    const size_t near_light = CountAreaPlaceableRowsWithAppearanceNear2d(
+        runtime->latest_area_placeable_light_rows,
+        appearance,
+        row->latest_update_x,
+        row->latest_update_y,
+        2.0);
+    text += L" pending_update_pos=[";
+    wchar_t pos_text[96]{};
+    swprintf_s(
+        pos_text,
+        L"%.2f,%.2f,%.2f",
+        static_cast<double>(row->latest_update_x),
+        static_cast<double>(row->latest_update_y),
+        static_cast<double>(row->latest_update_z));
+    text += pos_text;
+    text += L"] pending_same_app_static=";
+    text += std::to_wstring(total_static);
+    text += L" near_static<=2m=";
+    text += std::to_wstring(near_static);
+    text += L":";
+    text += FormatNearestAreaPlaceableRowsWithAppearancePreview(
+        runtime->latest_area_static_placeable_rows,
+        appearance,
+        row->latest_update_x,
+        row->latest_update_y,
+        row->latest_update_z,
+        4);
+    text += L" pending_same_app_light=";
+    text += std::to_wstring(total_light);
+    text += L" near_light<=2m=";
+    text += std::to_wstring(near_light);
+    text += L":";
+    text += FormatNearestAreaPlaceableRowsWithAppearancePreview(
+        runtime->latest_area_placeable_light_rows,
+        appearance,
+        row->latest_update_x,
+        row->latest_update_y,
+        row->latest_update_z,
+        4);
+  }
+  text += L"}";
+
+  row->appearance = appearance;
+  row->name = name;
+  row->has_add_record = true;
+  row->add_state = add_state;
+  return text;
+}
+
+std::wstring RememberLivePlaceableUpdateState(
+    BridgeRuntime* runtime,
+    uint32_t object_id,
+    const LivePlaceableSemanticBits& update_state,
+    bool has_position,
+    float x,
+    float y,
+    float z) {
+  if (runtime == nullptr) {
+    return L"state_history=runtime-unavailable";
+  }
+  LivePlaceableAddContextRow* row =
+      FindOrCreateLivePlaceableContextRow(runtime, object_id);
+  if (row == nullptr) {
+    return L"state_history=row-unavailable";
+  }
+
+  std::wstring text = L"state_history{update_count_before=";
+  text += std::to_wstring(row->update_count);
+  text += L" add_delta=";
+  text += FormatLivePlaceableAddUpdateDelta(row->add_state, update_state);
+  text += L" prior_update_delta=";
+  text += FormatLivePlaceableAddUpdateDelta(row->latest_update_state, update_state);
+  text += L"}";
+
+  row->latest_update_state = update_state;
+  ++row->update_count;
+  row->latest_update_has_position = has_position;
+  row->latest_update_x = x;
+  row->latest_update_y = y;
+  row->latest_update_z = z;
+  return text;
+}
+
+bool FindLivePlaceableAddContext(
+    const BridgeRuntime* runtime,
+    uint32_t object_id,
+    LivePlaceableAddContextRow* context) {
+  if (context != nullptr) {
+    *context = LivePlaceableAddContextRow{};
+  }
+  if (runtime == nullptr) {
+    return false;
+  }
+  const auto found = std::find_if(
+      runtime->latest_live_placeable_add_rows.begin(),
+      runtime->latest_live_placeable_add_rows.end(),
+      [object_id](const LivePlaceableAddContextRow& row) {
+        return row.object_id == object_id;
+      });
+  if (found == runtime->latest_live_placeable_add_rows.end()) {
+    return false;
+  }
+  if (!found->has_add_record) {
+    return false;
+  }
+  if (context != nullptr) {
+    *context = *found;
+  }
+  return true;
+}
+
+bool TryFindPlaceableAddContextInLiveBytes(
+    const std::vector<unsigned char>& bytes,
+    uint32_t object_id,
+    LivePlaceableAddContextRow* context) {
+  if (context != nullptr) {
+    *context = LivePlaceableAddContextRow{};
+  }
+  for (size_t offset = 0; offset + 11 <= bytes.size();) {
+    if (bytes[offset] != 'A' || bytes[offset + 1] != 9 ||
+        !LooksLikeLegacyLiveObjectIdAt(bytes, offset + 2)) {
+      ++offset;
+      continue;
+    }
+
+    size_t record_end = FindNextLegacyLiveObjectSubMessageBoundaryAfter(bytes, offset);
+    if (record_end > bytes.size()) {
+      record_end = bytes.size();
+    }
+
+    uint32_t candidate_id = 0;
+    if (!TryReadU32LeFromBytes(bytes, offset + 2, &candidate_id) ||
+        candidate_id != object_id) {
+      offset = record_end > offset ? record_end : offset + 1;
+      continue;
+    }
+
+    size_t name_offset = 0;
+    size_t visual_transform_offset = 0;
+    size_t fallback_name_length_offset = 0;
+    size_t fallback_name_text_start = 0;
+    size_t fallback_name_text_end = 0;
+    bool short_locstring = false;
+    if (!TryFindPlaceableAddNameForAddRecordRewrite(
+            bytes,
+            offset,
+            record_end,
+            &name_offset,
+            &visual_transform_offset,
+            &short_locstring,
+            &fallback_name_length_offset,
+            &fallback_name_text_start,
+            &fallback_name_text_end)) {
+      return false;
+    }
+    (void)visual_transform_offset;
+    (void)fallback_name_length_offset;
+
+    std::string name_preview;
+    uint32_t name_length = 0;
+    size_t name_end = name_offset;
+    uint32_t strref = 0;
+    if (!short_locstring) {
+      if (!LooksLikeInlineCExoStringAt(
+              bytes,
+              name_offset,
+              &name_length,
+              &name_end,
+              &name_preview) ||
+          name_end > record_end) {
+        if (fallback_name_text_end > fallback_name_text_start &&
+            fallback_name_text_end <= record_end) {
+          name_preview.assign(
+              reinterpret_cast<const char*>(bytes.data() + fallback_name_text_start),
+              fallback_name_text_end - fallback_name_text_start);
+          name_end = fallback_name_text_end;
+        } else {
+          return false;
+        }
+      }
+    } else {
+      if (name_offset + sizeof(uint32_t) > record_end ||
+          !TryReadU32LeFromBytes(bytes, name_offset, &strref)) {
+        return false;
+      }
+      char text[64]{};
+      std::snprintf(text, sizeof(text), "<tlk:%u>", strref);
+      name_preview = text;
+      name_end = name_offset + sizeof(uint32_t);
+    }
+
+    if (name_end + 3 > record_end) {
+      return false;
+    }
+    uint16_t appearance = 0;
+    (void)TryReadU16LeFromBytes(bytes, name_end + 1, &appearance);
+    if (context != nullptr) {
+      context->object_id = object_id;
+      context->appearance = appearance;
+      context->name = name_preview;
+    }
+    return true;
+  }
+  return false;
+}
+
+float DecodeNwnCnwQuantizedFloat(uint32_t raw, float divisor) {
+  return static_cast<float>(raw) / divisor;
+}
+
+float DecodeNwnCnwRangedFloat(uint32_t raw, float min_value, float max_value, uint32_t bits) {
+  const uint32_t max_raw = bits >= 32 ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+  if (max_raw == 0) {
+    return min_value;
+  }
+  const double ratio = static_cast<double>(raw) / static_cast<double>(max_raw);
+  return static_cast<float>(
+      static_cast<double>(min_value) +
+      ratio * (static_cast<double>(max_value) - static_cast<double>(min_value)));
+}
+
+uint32_t DecodeLiveObjectUpdateZRaw(
+    uint16_t fixed_z,
+    const std::vector<unsigned char>& bits,
+    size_t bit_cursor) {
+  uint32_t raw = static_cast<uint32_t>(fixed_z) << 2;
+  if (bit_cursor < bits.size() && bits[bit_cursor] != 0) {
+    raw |= 0x2u;
+  }
+  if (bit_cursor + 1 < bits.size() && bits[bit_cursor + 1] != 0) {
+    raw |= 0x1u;
+  }
+  return raw;
+}
+
+double AreaPositionDistance2d(
+    const AreaPlaceableContextRow& row,
+    float x,
+    float y) {
+  const double dx = static_cast<double>(row.x) - static_cast<double>(x);
+  const double dy = static_cast<double>(row.y) - static_cast<double>(y);
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+std::wstring FormatAreaPlaceableRowsWithAppearancePreview(
+    const std::vector<AreaPlaceableContextRow>& rows,
+    uint16_t appearance,
+    size_t max_count) {
+  std::wstring text;
+  size_t total = 0;
+  size_t written = 0;
+  for (const AreaPlaceableContextRow& row : rows) {
+    if (row.appearance != appearance) {
+      continue;
+    }
+    ++total;
+    if (written >= max_count) {
+      continue;
+    }
+    if (!text.empty()) {
+      text += L",";
+    }
+    wchar_t cell[192]{};
+    if (row.has_direction) {
+      swprintf_s(
+          cell,
+          L"0x%08X@(%.2f,%.2f,%.2f)dir=[%.3f,%.3f,%.3f]",
+          row.object_id,
+          static_cast<double>(row.x),
+          static_cast<double>(row.y),
+          static_cast<double>(row.z),
+          static_cast<double>(row.dir_x),
+          static_cast<double>(row.dir_y),
+          static_cast<double>(row.dir_z));
+    } else {
+      swprintf_s(
+          cell,
+          L"0x%08X@(%.2f,%.2f,%.2f)",
+          row.object_id,
+          static_cast<double>(row.x),
+          static_cast<double>(row.y),
+          static_cast<double>(row.z));
+    }
+    text += cell;
+    ++written;
+  }
+  if (text.empty()) {
+    return L"<none>";
+  }
+  if (total > written) {
+    text += L",...";
+  }
+  return text;
+}
+
+std::wstring FormatNearestAreaPlaceableRowsWithAppearancePreview(
+    const std::vector<AreaPlaceableContextRow>& rows,
+    uint16_t appearance,
+    float x,
+    float y,
+    float z,
+    size_t max_count) {
+  struct Match {
+    const AreaPlaceableContextRow* row = nullptr;
+    double distance = 0.0;
+  };
+  std::vector<Match> matches;
+  for (const AreaPlaceableContextRow& row : rows) {
+    if (row.appearance == appearance) {
+      matches.push_back({&row, AreaPositionDistance2d(row, x, y)});
+    }
+  }
+  if (matches.empty()) {
+    return L"<none>";
+  }
+  std::sort(
+      matches.begin(),
+      matches.end(),
+      [](const Match& left, const Match& right) {
+        return left.distance < right.distance;
+      });
+
+  std::wstring text;
+  const size_t count = std::min(matches.size(), max_count);
+  for (size_t index = 0; index < count; ++index) {
+    if (index != 0) {
+      text += L",";
+    }
+    const AreaPlaceableContextRow& row = *matches[index].row;
+    wchar_t cell[224]{};
+    if (row.has_direction) {
+      swprintf_s(
+          cell,
+          L"0x%08X@(%.2f,%.2f,%.2f)dir=[%.3f,%.3f,%.3f]d=%.2f%s",
+          row.object_id,
+          static_cast<double>(row.x),
+          static_cast<double>(row.y),
+          static_cast<double>(row.z),
+          static_cast<double>(row.dir_x),
+          static_cast<double>(row.dir_y),
+          static_cast<double>(row.dir_z),
+          matches[index].distance,
+          matches[index].distance <= 2.0 ? L"/near" : L"");
+    } else {
+      swprintf_s(
+          cell,
+          L"0x%08X@(%.2f,%.2f,%.2f)d=%.2f%s",
+          row.object_id,
+          static_cast<double>(row.x),
+          static_cast<double>(row.y),
+          static_cast<double>(row.z),
+          matches[index].distance,
+          matches[index].distance <= 2.0 ? L"/near" : L"");
+    }
+    text += cell;
+  }
+  if (matches.size() > count) {
+    text += L",...";
+  }
+  (void)z;
+  return text;
+}
+
 void AppendLiveAddRecordRewriteDiagnostic(
     LiveAddRecordRewriteResult* result,
+    BridgeRuntime* runtime,
     const std::vector<unsigned char>& bytes,
     size_t record_offset,
     size_t record_end,
     uint32_t object_id,
     size_t bit_cursor,
     size_t optional_bit,
-    size_t final_visual_bit,
+    size_t light_bit,
     size_t record_bit_span,
     size_t name_offset,
     size_t visual_transform_offset,
     bool short_locstring,
     bool legacy_outer_locstring,
-    bool optional_changed,
+    bool direct_name_mode_repaired,
+    bool optional_inserted,
     bool map_inserted,
     const std::vector<unsigned char>& before_bits,
     const std::vector<unsigned char>& after_bits) {
-  if (result == nullptr || result->diagnostics.size() > 3600) {
+  if (result == nullptr || result->diagnostics.size() > 12000) {
     return;
   }
 
@@ -17780,8 +21502,9 @@ void AppendLiveAddRecordRewriteDiagnostic(
   uint32_t name_length = 0;
   size_t name_end = safe_name_offset;
   uint32_t strref = 0;
+  bool inline_name_payload = false;
   if (!short_locstring) {
-    (void)LooksLikeInlineCExoStringAt(
+    inline_name_payload = LooksLikeInlineCExoStringAt(
         bytes,
         safe_name_offset,
         &name_length,
@@ -17814,25 +21537,127 @@ void AppendLiveAddRecordRewriteDiagnostic(
       : 0;
   const size_t bit_slice_start = bit_cursor >= 4 ? bit_cursor - 4 : 0;
   const size_t bit_slice_count = 24;
+  const bool inline_locstring_name = !short_locstring && legacy_outer_locstring;
+  const bool destination_inline_locstring_name =
+      inline_locstring_name && !direct_name_mode_repaired;
+  const size_t source_name_inner_bits =
+      destination_inline_locstring_name ? 1 : 0;
+  const size_t destination_name_inner_bits =
+      (short_locstring || destination_inline_locstring_name) ? 1 : 0;
+  const LivePlaceableSemanticBits add_state =
+      MakeLivePlaceableAddDestinationSemanticBits(
+          after_bits,
+          bit_cursor,
+          short_locstring,
+          destination_inline_locstring_name);
+  const std::wstring state_history = RememberLivePlaceableAddContext(
+      runtime,
+      object_id,
+      appearance_id,
+      name_preview,
+      add_state);
+  const size_t destination_optional_bit = bit_cursor + 2 + destination_name_inner_bits;
+  const size_t source_optional_bit = bit_cursor + 2 + source_name_inner_bits;
+  const int source_optional_value =
+      CnwBitValueOrUnknown(before_bits, source_optional_bit);
+  const int destination_optional_value =
+      CnwBitValueOrUnknown(after_bits, destination_optional_bit);
+  const int source_inner_value = inline_locstring_name
+      ? CnwBitValueOrUnknown(before_bits, bit_cursor + 1)
+      : -1;
+  const size_t optional_payload_offset = name_end + 5;
+  std::wstring optional_payload_text;
+  optional_payload_text = L"legacy-gate-consumed-no-ee-object-id@";
+  optional_payload_text += std::to_wstring(optional_payload_offset);
 
-  wchar_t text[1400]{};
+  const bool name_mode_suspicious =
+      inline_locstring_name && inline_name_payload && source_inner_value == 1 &&
+      !direct_name_mode_repaired;
+  const bool optional_mismatch = false;
+  if (name_mode_suspicious) {
+    ++result->placeable_name_mode_suspicious;
+  }
+  if (direct_name_mode_repaired) {
+    ++result->placeable_name_mode_direct_repairs;
+  }
+  const std::wstring drift_probe =
+      (name_mode_suspicious || direct_name_mode_repaired)
+          ? FormatLivePlaceableNameModeDriftProbe(before_bits, bit_cursor)
+          : L"drift_probe=not-needed";
+  const bool area_static_overlap =
+      runtime != nullptr &&
+      ContainsObjectId(runtime->latest_area_static_placeable_ids, object_id);
+  const bool area_light_overlap =
+      runtime != nullptr &&
+      ContainsObjectId(runtime->latest_area_placeable_light_ids, object_id);
+  const std::wstring area_resref_text =
+      runtime != nullptr && !runtime->latest_area_resref.empty()
+          ? AsciiPreviewToWide(runtime->latest_area_resref, 32)
+          : L"<none>";
+  const size_t area_static_same_app_count = runtime != nullptr
+      ? CountAreaPlaceableRowsWithAppearance(
+            runtime->latest_area_static_placeable_rows,
+            appearance_id)
+      : 0;
+  const size_t area_light_same_app_count = runtime != nullptr
+      ? CountAreaPlaceableRowsWithAppearance(
+            runtime->latest_area_placeable_light_rows,
+            appearance_id)
+      : 0;
+  const std::wstring area_static_same_app_preview = runtime != nullptr
+      ? FormatAreaPlaceableRowsWithAppearancePreview(
+            runtime->latest_area_static_placeable_rows,
+            appearance_id,
+            4)
+      : L"<none>";
+  const std::wstring area_light_same_app_preview = runtime != nullptr
+      ? FormatAreaPlaceableRowsWithAppearancePreview(
+            runtime->latest_area_placeable_light_rows,
+            appearance_id,
+            4)
+      : L"<none>";
+
+  wchar_t text[4700]{};
   swprintf_s(
       text,
-      L"%s+%zu placeable id=0x%08X bits[cursor=%zu opt=%zu final=%zu span=%zu before=%s after=%s] name_off=%zu name_len=%u name='%s' short=%d outer=%d vt_off=%zu tail[type=0x%02X/%u app=0x%04X/%u bodybag=0x%04X/%u] opt_changed=%d map=%d raw-len=%zu raw=[%s]",
+      L"%s+%zu placeable id=0x%08X bits[cursor=%zu opt=%zu light=%zu span=%zu before=%s after=%s %s %s %s] %s name_off=%zu name_len=%u name='%s' short=%d outer=%d src_inner=%d name_mode_suspicious=%d name_mode_direct_repair=%d area='%s' area_static_overlap=%d area_light_overlap=%d area_same_app[static=%zu:%s light=%zu:%s] vt_off=%zu tail[type=0x%02X/%u app=0x%04X/%u bodybag=0x%04X/%u] opt_inserted=%d legacy_optional_gate_consumed=1 src_opt=%d dst_opt=%d optional_payload=%s optional_mismatch=%d forced_optional_false=%d map=%d raw-len=%zu raw=[%s]",
       result->diagnostics.empty() ? L"" : L"; ",
       record_offset,
       object_id,
       bit_cursor,
       optional_bit,
-      final_visual_bit,
+      light_bit,
       record_bit_span,
       FormatCnwBitSlice(before_bits, bit_slice_start, bit_slice_count).c_str(),
       FormatCnwBitSlice(after_bits, bit_slice_start, bit_slice_count).c_str(),
+      FormatLivePlaceableAddSourceBitMap(
+          before_bits,
+          bit_cursor,
+          short_locstring,
+          inline_locstring_name,
+          direct_name_mode_repaired).c_str(),
+      FormatLivePlaceableAddDestinationBitMap(
+          after_bits,
+          bit_cursor,
+          short_locstring,
+          destination_inline_locstring_name).c_str(),
+      drift_probe.c_str(),
+      state_history.c_str(),
       name_offset,
       name_length,
       AsciiPreviewToWide(name_preview, 96).c_str(),
       short_locstring ? 1 : 0,
       legacy_outer_locstring ? 1 : 0,
+      source_inner_value,
+      name_mode_suspicious ? 1 : 0,
+      direct_name_mode_repaired ? 1 : 0,
+      area_resref_text.c_str(),
+      area_static_overlap ? 1 : 0,
+      area_light_overlap ? 1 : 0,
+      area_static_same_app_count,
+      area_static_same_app_preview.c_str(),
+      area_light_same_app_count,
+      area_light_same_app_preview.c_str(),
       visual_transform_offset,
       static_cast<unsigned int>(appearance_type),
       static_cast<unsigned int>(appearance_type),
@@ -17840,7 +21665,12 @@ void AppendLiveAddRecordRewriteDiagnostic(
       static_cast<unsigned int>(appearance_id),
       static_cast<unsigned int>(bodybag),
       static_cast<unsigned int>(bodybag),
-      optional_changed ? 1 : 0,
+      optional_inserted ? 1 : 0,
+      source_optional_value,
+      destination_optional_value,
+      optional_payload_text.c_str(),
+      optional_mismatch ? 1 : 0,
+      destination_optional_value == 0 ? 1 : 0,
       map_inserted ? 1 : 0,
       raw_length,
       raw_length != 0
@@ -17971,11 +21801,53 @@ bool TryGetLegacyLiveShortAddFragmentBitSpan(
     return bit_cursor <= bits.size() && *bit_span <= bits.size() - bit_cursor;
   }
 
-  (void)bits;
+  size_t name_offset = 0;
+  size_t tail_offset = 0;
+  bool short_locstring = false;
+  if (!TryFindPlaceableAddNameForAddRecordRewrite(
+          bytes,
+          record_offset,
+          record_end,
+          &name_offset,
+          &tail_offset,
+          &short_locstring) ||
+      bit_cursor >= bits.size()) {
+    return false;
+  }
+  (void)tail_offset;
+
+  bool direct_inline_name_payload = false;
+  if (!short_locstring) {
+    uint32_t ignored_name_length = 0;
+    size_t ignored_name_end = 0;
+    direct_inline_name_payload = LooksLikeInlineCExoStringAt(
+        bytes,
+        name_offset,
+        &ignored_name_length,
+        &ignored_name_end,
+        nullptr) &&
+        ignored_name_end <= record_end;
+  }
+  const bool legacy_outer_locstring = bits[bit_cursor] != 0;
+  const bool legacy_inner_client_tlk =
+      !short_locstring &&
+      legacy_outer_locstring &&
+      bit_cursor + 1 < bits.size() &&
+      bits[bit_cursor + 1] != 0;
+  const bool direct_name_mode_repair =
+      legacy_outer_locstring &&
+      legacy_inner_client_tlk &&
+      direct_inline_name_payload;
+  const bool inline_locstring_name =
+      !short_locstring &&
+      legacy_outer_locstring &&
+      !direct_name_mode_repair;
+
   // See AdvanceLegacyLiveAddRecordBitCursor: skipped legacy placeable adds own
-  // ten source bits. Synthetic EE bits are only erased when they were actually
+  // ten source bits, plus a locstring inner/client-tlk bit for normal
+  // outer=true names. Synthetic EE bits are only erased when they were actually
   // inserted, not while accounting for an unrewritten legacy record.
-  *bit_span = 10;
+  *bit_span = inline_locstring_name ? 11 : 10;
   return bit_cursor <= bits.size() && *bit_span <= bits.size() - bit_cursor;
 }
 
@@ -17996,6 +21868,8 @@ bool RewriteLegacyLiveObjectAddRecords(
         ? static_cast<uint32_t>(fragment_bytes->size())
         : 0;
     result->new_fragment_bytes = result->old_fragment_bytes;
+    result->placeable_name_mode_suspicious = 0;
+    result->placeable_name_mode_direct_repairs = 0;
     result->short_add_records_skipped = 0;
     result->short_add_bytes_skipped = 0;
     result->short_add_bits_skipped = 0;
@@ -18405,6 +22279,9 @@ bool RewriteLegacyLiveObjectAddRecords(
     } else if (object_type == 9) {
       size_t name_offset = 0;
       size_t visual_transform_offset = 0;
+      size_t fallback_name_length_offset = 0;
+      size_t fallback_name_text_start = 0;
+      size_t fallback_name_text_end = 0;
       bool short_locstring = false;
       if (!TryFindPlaceableAddNameForAddRecordRewrite(
               *live_bytes,
@@ -18412,10 +22289,28 @@ bool RewriteLegacyLiveObjectAddRecords(
               record_end,
               &name_offset,
               &visual_transform_offset,
-              &short_locstring)) {
+              &short_locstring,
+              &fallback_name_length_offset,
+              &fallback_name_text_start,
+              &fallback_name_text_end)) {
         bit_cursor_reliable = false;
         offset = record_end > offset ? record_end : offset + 1;
         continue;
+      }
+      const bool recovered_empty_inline_name =
+          fallback_name_text_end > fallback_name_text_start;
+      if (recovered_empty_inline_name) {
+        const size_t fallback_length = fallback_name_text_end - fallback_name_text_start;
+        if (fallback_name_length_offset > live_bytes->size() ||
+            live_bytes->size() - fallback_name_length_offset < 4 ||
+            fallback_length > UINT32_MAX) {
+          bit_cursor_reliable = false;
+          offset = record_end > offset ? record_end : offset + 1;
+          continue;
+        }
+        WriteU32Le(
+            live_bytes->data() + fallback_name_length_offset,
+            static_cast<uint32_t>(fallback_length));
       }
       if (bit_cursor >= bits.size()) {
         bit_cursor_reliable = false;
@@ -18424,7 +22319,32 @@ bool RewriteLegacyLiveObjectAddRecords(
       }
       const std::vector<unsigned char> before_placeable_bits = bits;
       const bool legacy_outer_locstring = bits[bit_cursor] != 0;
-      const bool inline_locstring_name = !short_locstring && legacy_outer_locstring;
+      bool direct_inline_name_payload = false;
+      if (!short_locstring) {
+        uint32_t ignored_name_length = 0;
+        size_t ignored_name_end = 0;
+        std::string ignored_name_preview;
+        direct_inline_name_payload = LooksLikeInlineCExoStringAt(
+            *live_bytes,
+            name_offset,
+            &ignored_name_length,
+            &ignored_name_end,
+            &ignored_name_preview) &&
+            ignored_name_end <= record_end;
+      }
+      const bool legacy_inner_client_tlk =
+          !short_locstring &&
+          legacy_outer_locstring &&
+          bit_cursor + 1 < before_placeable_bits.size() &&
+          before_placeable_bits[bit_cursor + 1] != 0;
+      const bool direct_name_mode_repair =
+          legacy_outer_locstring &&
+          legacy_inner_client_tlk &&
+          direct_inline_name_payload;
+      const bool inline_locstring_name =
+          !short_locstring &&
+          legacy_outer_locstring &&
+          !direct_name_mode_repair;
       const size_t source_name_inner_bits = inline_locstring_name ? 1 : 0;
       const size_t destination_name_inner_bits =
           (short_locstring || inline_locstring_name) ? 1 : 0;
@@ -18437,13 +22357,15 @@ bool RewriteLegacyLiveObjectAddRecords(
 
       bool outer_changed = false;
       bool inner_changed = false;
-      bool optional_changed = false;
+      bool optional_inserted = false;
       uint32_t semantic_state_bits_changed = 0;
       uint32_t inserted_bits_this_record = 0;
       const size_t optional_bit = bit_cursor + 2 + destination_name_inner_bits;
-      const size_t final_visual_bit = bit_cursor + 10 + destination_name_inner_bits;
+      const size_t light_bit = bit_cursor + 10 + destination_name_inner_bits;
       const size_t record_bit_span = 11 + destination_name_inner_bits;
-      const wchar_t* action = L"placeable-string-name+optional-target+final-visual";
+      const wchar_t* action = recovered_empty_inline_name
+          ? L"placeable-empty-inline-name-length+insert-optional-target+set-light"
+          : L"placeable-string-name+insert-optional-target+set-light";
 
       if (short_locstring) {
         // The hook forced short 1.69 locstring names through EE's locstring
@@ -18458,10 +22380,21 @@ bool RewriteLegacyLiveObjectAddRecords(
         }
         ++inserted_bits_this_record;
         WriteU32Le(live_bytes->data() + name_offset, 0);
-        action = L"placeable-short-locstring-name-inner-string+optional-target+final-visual";
+        action = L"placeable-short-locstring-name-inner-string+insert-optional-target+set-light";
         if (result != nullptr) {
           ++result->short_locstrings_flattened;
         }
+      } else if (direct_name_mode_repair) {
+        // The wire has a direct CExoString at the name cursor, but the legacy
+        // bits say outer=true/inner=true, which would take the TLK/strref path
+        // in both Diamond and EE. Treat the inner bit as the first post-name
+        // state bit and force EE onto the direct string branch.
+        if (!SetCnwMsbBit(&bits, bit_cursor, false, &outer_changed)) {
+          bit_cursor_reliable = false;
+          offset = record_end > offset ? record_end : offset + 1;
+          continue;
+        }
+        action = L"placeable-direct-name-mode-repair+insert-optional-target+set-light";
       } else if (inline_locstring_name) {
         // The legacy outer bit is true, so Diamond and EE both route through
         // the locstring helper and spend the following inner/client-tlk bit.
@@ -18472,22 +22405,24 @@ bool RewriteLegacyLiveObjectAddRecords(
           offset = record_end > offset ? record_end : offset + 1;
           continue;
         }
-        action = L"placeable-inline-locstring-name-inner-string+optional-target+final-visual";
+        action = L"placeable-inline-locstring-name-inner-string+insert-optional-target+set-light";
       }
 
-      const bool optional_ok = SetCnwMsbBit(&bits, optional_bit, false, &optional_changed);
-      if (!optional_ok || !InsertCnwMsbBit(&bits, final_visual_bit, false)) {
+      if (!InsertCnwMsbBit(&bits, optional_bit, false)) {
         bit_cursor_reliable = false;
         offset = record_end > offset ? record_end : offset + 1;
         continue;
       }
+      optional_inserted = true;
       ++inserted_bits_this_record;
 
-      // Diamond and EE agree on the first post-name state BOOL and optional
-      // target slot. After that, Diamond's var_4C belongs in EE's first
-      // post-target storage slot and Diamond's var_48 belongs in EE's
-      // SetUseable reader; keep the post-target state bits in read order and
-      // add only EE's final visual/effect gate.
+      // HG's legacy stream has a BOOL at EE's optional-target read site, but
+      // the old tested hook consumed that bit and returned false so EE did not
+      // read an absent object-id payload. Inserting that one false gate creates
+      // the only extra EE bit we need: after the seven legacy state bits slide
+      // left over the consumed legacy gate, the final slot is EE's LoadLight
+      // gate. Inserting a separate light bit would duplicate legacy var_34 into
+      // the next record's fragment cursor.
       const size_t source_shift = source_name_inner_bits;
       const size_t post_name_bit = bit_cursor + 1 + destination_name_inner_bits;
       if (bits.size() <= post_name_bit + 9) {
@@ -18526,10 +22461,14 @@ bool RewriteLegacyLiveObjectAddRecords(
       }
       if (semantic_state_bits_changed != 0) {
         action = short_locstring
-            ? L"placeable-short-locstring-name-inner-string+optional-target+semantic-state-map+final-visual"
-            : (inline_locstring_name
-                ? L"placeable-inline-locstring-name-inner-string+optional-target+semantic-state-map+final-visual"
-                : L"placeable-string-name+optional-target+semantic-state-map+final-visual");
+            ? L"placeable-short-locstring-name-inner-string+insert-optional-target+semantic-state-map+set-light"
+            : (direct_name_mode_repair
+                ? L"placeable-direct-name-mode-repair+insert-optional-target+semantic-state-map+set-light"
+                : (inline_locstring_name
+                ? L"placeable-inline-locstring-name-inner-string+insert-optional-target+semantic-state-map+set-light"
+                : (recovered_empty_inline_name
+                    ? L"placeable-empty-inline-name-length+insert-optional-target+semantic-state-map+set-light"
+                    : L"placeable-string-name+insert-optional-target+semantic-state-map+set-light")));
       }
 
       bool map_inserted = false;
@@ -18555,9 +22494,6 @@ bool RewriteLegacyLiveObjectAddRecords(
         if (inner_changed) {
           ++result->bits_set_or_extended;
         }
-        if (optional_changed) {
-          ++result->bits_set_or_extended;
-        }
         result->bits_set_or_extended += semantic_state_bits_changed;
         result->bits_inserted += inserted_bits_this_record;
         ++result->records_rewritten;
@@ -18569,19 +22505,21 @@ bool RewriteLegacyLiveObjectAddRecords(
             map_inserted ? L"placeable-bits+semantic-state-map+visual-map" : action);
         AppendLiveAddRecordRewriteDiagnostic(
             result,
+            runtime,
             *live_bytes,
             offset,
             record_end,
             object_id,
             bit_cursor,
             optional_bit,
-            final_visual_bit,
+            light_bit,
             record_bit_span,
             name_offset,
             visual_transform_offset,
             short_locstring,
             legacy_outer_locstring,
-            optional_changed,
+            direct_name_mode_repair,
+            optional_inserted,
             map_inserted,
             before_placeable_bits,
             bits);
@@ -18589,45 +22527,63 @@ bool RewriteLegacyLiveObjectAddRecords(
       rewritten = true;
       bit_cursor += record_bit_span;
     } else if (object_type == 7) {
-      uint8_t primary_flag = 0;
+      size_t source_bits = 0;
+      bool locstring_name_branch = false;
+      bool first_state = false;
+      bool second_state = false;
+      bool third_state_present = false;
+      bool third_state = false;
+      uint8_t cursor_byte = 0;
       uint8_t vertex_count = 0;
-      if (!TryReadLegacyTriggerAddShape(
+      if (!TryGetLegacyTriggerAddFragmentBitSpan(
               *live_bytes,
+              bits,
               offset,
               record_end,
-              &primary_flag,
+              bit_cursor,
+              &source_bits,
+              &locstring_name_branch,
+              &first_state,
+              &second_state,
+              &third_state_present,
+              &third_state,
+              &cursor_byte,
               &vertex_count)) {
         bit_cursor_reliable = false;
         offset = record_end > offset ? record_end : offset + 1;
         continue;
       }
 
-      std::vector<unsigned char> inserted_bits{0, static_cast<unsigned char>(primary_flag ? 1 : 0), 0};
-      if (primary_flag != 0) {
-        inserted_bits.push_back(0);
+      if (runtime != nullptr) {
+        LogFormat(
+            L"server->client live-object trigger add preserved: offset=%zu id=0x%08X name_branch=%s cursor=%u vertices=%u source_bits=%zu state=%u,%u,%u third_present=%u",
+            offset,
+            object_id,
+            locstring_name_branch ? L"locstring" : L"string",
+            static_cast<unsigned int>(cursor_byte),
+            static_cast<unsigned int>(vertex_count),
+            source_bits,
+            first_state ? 1u : 0u,
+            second_state ? 1u : 0u,
+            third_state ? 1u : 0u,
+            third_state_present ? 1u : 0u);
       }
-      if (!InsertCnwMsbBits(&bits, bit_cursor, inserted_bits)) {
-        bit_cursor_reliable = false;
-        offset = record_end > offset ? record_end : offset + 1;
-        continue;
-      }
-
-      WriteU32Le(live_bytes->data() + offset + 6, 0);
-      (*live_bytes)[offset + 10] = 1;
-      rewritten = true;
       if (result != nullptr) {
-        ++result->records_rewritten;
-        ++result->trigger_records_rewritten;
-        result->bits_inserted += static_cast<uint32_t>(inserted_bits.size());
-        wchar_t action[128]{};
+        wchar_t action[192]{};
         swprintf_s(
             action,
-            L"trigger-locstring+primary=%u+cursor vertices=%u",
-            static_cast<unsigned int>(primary_flag),
-            static_cast<unsigned int>(vertex_count));
+            L"trigger-compatible-preserved name=%s cursor=%u state=%u,%u,%u third_present=%u vertices=%u source_bits=%zu",
+            locstring_name_branch ? L"locstring" : L"string",
+            static_cast<unsigned int>(cursor_byte),
+            first_state ? 1u : 0u,
+            second_state ? 1u : 0u,
+            third_state ? 1u : 0u,
+            third_state_present ? 1u : 0u,
+            static_cast<unsigned int>(vertex_count),
+            source_bits);
         AppendLiveAddRecordRewriteDetail(result, offset, object_type, object_id, action);
       }
-      bit_cursor += inserted_bits.size();
+      bit_cursor += source_bits;
     }
 
     offset = record_end > offset ? record_end : offset + 1;
@@ -20139,9 +24095,10 @@ std::wstring FormatQuickbarButtonInventorySummary(const std::vector<QuickbarButt
       const std::wstring secondary_name = AsciiPreviewToWide(button.secondary_item.name_preview, 32);
       swprintf_s(
           entry,
-          L"%zu:item(type=%u,off=%zu..%zu,frag=%zu:%u..%zu:%u,p=%d/0x%08X base=%u model=%u,s=%d/0x%08X base=%u model=%u,name='%s'%s%s%s)",
+          L"%zu:item(type=%u%s,off=%zu..%zu,frag=%zu:%u..%zu:%u,p=%d/0x%08X base=%u model=%u,s=%d/0x%08X base=%u model=%u,name='%s'%s%s%s)",
           button.slot,
           static_cast<unsigned int>(button.type),
+          button.recovered_item_type_tag ? L",recovered-type" : L"",
           button.offset,
           button.next_offset,
           button.source_fragment_offset,
@@ -21591,6 +25548,10 @@ void ObserveLatestClientSequenceFromClient(BridgeRuntime* runtime, const std::ve
 
   runtime->latest_client_sequence_from_client = view.sequence;
   runtime->have_latest_client_sequence_from_client = true;
+  if (view.ack_sequence != 0) {
+    runtime->latest_client_ack_from_client = view.ack_sequence;
+    runtime->have_latest_client_ack_from_client = true;
+  }
 }
 
 void ObserveClientVaultListStartupMessage(BridgeRuntime* runtime, const std::vector<unsigned char>& packet) {
@@ -21810,31 +25771,84 @@ void QueueSyntheticAreaLoadedClientPacket(BridgeRuntime* runtime, uint16_t serve
 void ScheduleSyntheticAreaLoadedClientPacketAfterClientAck(
     BridgeRuntime* runtime,
     uint16_t server_ack_sequence,
-    uint16_t release_client_ack_sequence) {
+    uint16_t release_client_ack_sequence,
+    ULONGLONG release_due_tick) {
   if (runtime == nullptr) {
     return;
   }
 
   if (runtime->pending_area_loaded_client_packet) {
     LogFormat(
-        L"client->server synthetic Area_AreaLoaded deferred packet replaced: old_server_ack=%u old_release_client_ack=%u new_server_ack=%u new_release_client_ack=%u",
+        L"client->server synthetic Area_AreaLoaded deferred packet replaced: old_server_ack=%u old_release_client_ack=%u old_due_tick=%llu new_server_ack=%u new_release_client_ack=%u new_due_tick=%llu",
         runtime->pending_area_loaded_server_ack_sequence,
         runtime->pending_area_loaded_release_client_ack_sequence,
+        static_cast<unsigned long long>(runtime->pending_area_loaded_release_due_tick),
         server_ack_sequence,
-        release_client_ack_sequence);
+        release_client_ack_sequence,
+        static_cast<unsigned long long>(release_due_tick));
   }
 
   runtime->pending_area_loaded_client_packet = true;
   runtime->pending_area_loaded_server_ack_sequence = server_ack_sequence;
   runtime->pending_area_loaded_release_client_ack_sequence = release_client_ack_sequence;
+  runtime->pending_area_loaded_release_due_tick = release_due_tick;
   ++runtime->area_client_area_loaded_deferred_count;
   LogFormat(
-      L"client->server synthetic Area_AreaLoaded deferred #%llu: server_ack=%u release_client_ack=%u latest_client_seq_known=%d latest_client_seq=%u",
+      L"client->server synthetic Area_AreaLoaded deferred #%llu: server_ack=%u release_client_ack=%u release_due_tick=%llu delay_ms=%llu latest_client_seq_known=%d latest_client_seq=%u",
       static_cast<unsigned long long>(runtime->area_client_area_loaded_deferred_count),
       server_ack_sequence,
       release_client_ack_sequence,
+      static_cast<unsigned long long>(release_due_tick),
+      static_cast<unsigned long long>(
+          release_due_tick > GetTickCount64() ? release_due_tick - GetTickCount64() : 0),
       runtime->have_latest_client_sequence_from_client ? 1 : 0,
       runtime->latest_client_sequence_from_client);
+}
+
+bool IsNativeClientAreaLoadedPacket(const std::vector<unsigned char>& packet, GameplayWrapperView* view_out) {
+  GameplayWrapperView view;
+  if (!TryParseGameplayWrapper(packet.data(), packet.size(), &view) ||
+      !view.has_high_envelope ||
+      view.high_major != 0x04 ||
+      view.high_minor != 0x03) {
+    return false;
+  }
+  if (view_out != nullptr) {
+    *view_out = view;
+  }
+  return true;
+}
+
+void CancelPendingSyntheticAreaLoadedForNativeClientPacket(
+    BridgeRuntime* runtime,
+    const std::vector<unsigned char>& packet) {
+  if (runtime == nullptr || !runtime->pending_area_loaded_client_packet ||
+      packet.empty() || packet.front() != 'M') {
+    return;
+  }
+
+  GameplayWrapperView view;
+  if (!IsNativeClientAreaLoadedPacket(packet, &view)) {
+    return;
+  }
+
+  const uint16_t pending_server_ack = runtime->pending_area_loaded_server_ack_sequence;
+  const uint16_t pending_release_ack = runtime->pending_area_loaded_release_client_ack_sequence;
+  const ULONGLONG pending_due_tick = runtime->pending_area_loaded_release_due_tick;
+  runtime->pending_area_loaded_client_packet = false;
+  runtime->pending_area_loaded_server_ack_sequence = 0;
+  runtime->pending_area_loaded_release_client_ack_sequence = 0;
+  runtime->pending_area_loaded_release_due_tick = 0;
+  ++runtime->area_client_area_loaded_canceled_count;
+  LogFormat(
+      L"client->server synthetic Area_AreaLoaded canceled #%llu: native Area_AreaLoaded observed seq=%u ack=%u pending_server_ack=%u release_client_ack=%u due_tick=%llu payload_len=%zu",
+      static_cast<unsigned long long>(runtime->area_client_area_loaded_canceled_count),
+      view.sequence,
+      view.ack_sequence,
+      pending_server_ack,
+      pending_release_ack,
+      static_cast<unsigned long long>(pending_due_tick),
+      view.payload_length);
 }
 
 void MaybeReleasePendingSyntheticAreaLoadedAfterClientAck(
@@ -21851,6 +25865,20 @@ void MaybeReleasePendingSyntheticAreaLoadedAfterClientAck(
   }
 
   const uint16_t release_ack = runtime->pending_area_loaded_release_client_ack_sequence;
+  const ULONGLONG now_tick = GetTickCount64();
+  if (now_tick < runtime->pending_area_loaded_release_due_tick) {
+    if (runtime->options.packet_dump) {
+      LogFormat(
+          L"client->server synthetic Area_AreaLoaded still deferred by load delay: observed_client_ack=%u release_client_ack=%u server_ack=%u due_tick=%llu remaining_ms=%llu",
+          view.ack_sequence,
+          release_ack,
+          runtime->pending_area_loaded_server_ack_sequence,
+          static_cast<unsigned long long>(runtime->pending_area_loaded_release_due_tick),
+          static_cast<unsigned long long>(runtime->pending_area_loaded_release_due_tick - now_tick));
+    }
+    return;
+  }
+
   if (!SequenceAtOrAfter(view.ack_sequence, release_ack)) {
     if (runtime->options.packet_dump) {
       LogFormat(
@@ -21866,14 +25894,56 @@ void MaybeReleasePendingSyntheticAreaLoadedAfterClientAck(
   runtime->pending_area_loaded_client_packet = false;
   runtime->pending_area_loaded_server_ack_sequence = 0;
   runtime->pending_area_loaded_release_client_ack_sequence = 0;
+  runtime->pending_area_loaded_release_due_tick = 0;
   ++runtime->area_client_area_loaded_released_count;
   LogFormat(
-      L"client->server synthetic Area_AreaLoaded releasing #%llu: observed_client_ack=%u release_client_ack=%u server_ack=%u client_seq=%u",
+      L"client->server synthetic Area_AreaLoaded releasing #%llu: observed_client_ack=%u release_client_ack=%u server_ack=%u client_seq=%u due_tick=%llu",
       static_cast<unsigned long long>(runtime->area_client_area_loaded_released_count),
       view.ack_sequence,
       release_ack,
       server_ack_sequence,
-      view.sequence);
+      view.sequence,
+      static_cast<unsigned long long>(now_tick));
+  QueueSyntheticAreaLoadedClientPacket(runtime, server_ack_sequence);
+}
+
+void MaybeReleasePendingSyntheticAreaLoadedAfterLatestAck(BridgeRuntime* runtime) {
+  if (runtime == nullptr || !runtime->pending_area_loaded_client_packet ||
+      !runtime->have_latest_client_ack_from_client) {
+    return;
+  }
+
+  const ULONGLONG now_tick = GetTickCount64();
+  if (now_tick < runtime->pending_area_loaded_release_due_tick) {
+    return;
+  }
+
+  const uint16_t release_ack = runtime->pending_area_loaded_release_client_ack_sequence;
+  const uint16_t observed_ack = runtime->latest_client_ack_from_client;
+  if (!SequenceAtOrAfter(observed_ack, release_ack)) {
+    if (runtime->options.packet_dump) {
+      LogFormat(
+          L"client->server synthetic Area_AreaLoaded latest-ack release still deferred: observed_client_ack=%u release_client_ack=%u server_ack=%u",
+          observed_ack,
+          release_ack,
+          runtime->pending_area_loaded_server_ack_sequence);
+    }
+    return;
+  }
+
+  const uint16_t server_ack_sequence = runtime->pending_area_loaded_server_ack_sequence;
+  runtime->pending_area_loaded_client_packet = false;
+  runtime->pending_area_loaded_server_ack_sequence = 0;
+  runtime->pending_area_loaded_release_client_ack_sequence = 0;
+  runtime->pending_area_loaded_release_due_tick = 0;
+  ++runtime->area_client_area_loaded_released_count;
+  LogFormat(
+      L"client->server synthetic Area_AreaLoaded releasing from latest ack #%llu: observed_client_ack=%u release_client_ack=%u server_ack=%u due_tick=%llu",
+      static_cast<unsigned long long>(runtime->area_client_area_loaded_released_count),
+      observed_ack,
+      release_ack,
+      server_ack_sequence,
+      static_cast<unsigned long long>(now_tick));
   QueueSyntheticAreaLoadedClientPacket(runtime, server_ack_sequence);
 }
 
@@ -21929,12 +25999,19 @@ uint16_t QueuePendingAreaClientAreaLoadBarCompletion(
   const uint16_t base = runtime->pending_area_loadbar_shift_base != 0
       ? runtime->pending_area_loadbar_shift_base
       : static_cast<uint16_t>(original_after + 1);
+  const ULONGLONG now_tick = GetTickCount64();
+  const ULONGLONG end_due_tick =
+      now_tick + runtime->options.synthetic_area_load_completion_delay_ms;
   runtime->server_sequence_shifts.push_back(ServerSequenceShift{base, kSyntheticAreaLoadBarFrameCount});
   extra_packets->push_back(std::move(start_packet));
-  extra_packets->push_back(std::move(end_packet));
+  PendingServerPacket delayed_end;
+  delayed_end.bytes = std::move(end_packet);
+  delayed_end.due_tick = end_due_tick;
+  delayed_end.reason = L"Area_ClientArea synthetic LoadBar_End";
+  runtime->pending_server_to_client_packets.push_back(std::move(delayed_end));
   ++runtime->area_client_area_loadbar_completion_count;
   LogFormat(
-      L"server->client Area_ClientArea synthetic LoadBar M frames queued #%llu: after_seq=%u after_is_client=%d shifted_after_seq=%u start_seq=%u end_seq=%u ack=%u shift_base=%u shift_delta=%u active_shifts=%zu",
+      L"server->client Area_ClientArea synthetic LoadBar M frames queued #%llu: after_seq=%u after_is_client=%d shifted_after_seq=%u start_seq=%u end_seq=%u ack=%u shift_base=%u shift_delta=%u end_delay_ms=%u end_due_tick=%llu active_shifts=%zu delayed_server_packets=%zu",
       static_cast<unsigned long long>(runtime->area_client_area_loadbar_completion_count),
       original_after,
       runtime->pending_area_loadbar_after_sequence_is_client ? 1 : 0,
@@ -21944,7 +26021,10 @@ uint16_t QueuePendingAreaClientAreaLoadBarCompletion(
       ack_sequence,
       base,
       kSyntheticAreaLoadBarFrameCount,
-      runtime->server_sequence_shifts.size());
+      runtime->options.synthetic_area_load_completion_delay_ms,
+      static_cast<unsigned long long>(end_due_tick),
+      runtime->server_sequence_shifts.size(),
+      runtime->pending_server_to_client_packets.size());
   runtime->pending_area_loadbar_completion = false;
   runtime->pending_area_loadbar_after_sequence_is_client = false;
   runtime->pending_area_loadbar_shift_base = 0;
@@ -21971,11 +26051,27 @@ void QueuePendingAreaClientAreaSideEffects(
       QueuePendingAreaClientAreaLoadBarCompletion(runtime, extra_packets);
   const uint16_t release_client_ack_sequence =
       static_cast<uint16_t>(shifted_after_sequence + synthetic_loadbar_frame_count);
+  ULONGLONG release_due_tick =
+      GetTickCount64() + runtime->options.synthetic_area_load_completion_delay_ms;
+  if (synthetic_loadbar_frame_count != 0 &&
+      !runtime->pending_server_to_client_packets.empty()) {
+    release_due_tick = runtime->pending_server_to_client_packets.back().due_tick;
+  }
+  const ULONGLONG loadbar_release_due_tick = release_due_tick;
+  release_due_tick += kDefaultSyntheticAreaLoadedFallbackGraceMs;
   if (runtime->options.synthesize_area_loaded) {
+    LogFormat(
+        L"client->server synthetic Area_AreaLoaded fallback armed: server_ack=%u release_client_ack=%u loadbar_due_tick=%llu fallback_grace_ms=%u fallback_due_tick=%llu",
+        server_ack_sequence,
+        release_client_ack_sequence,
+        static_cast<unsigned long long>(loadbar_release_due_tick),
+        kDefaultSyntheticAreaLoadedFallbackGraceMs,
+        static_cast<unsigned long long>(release_due_tick));
     ScheduleSyntheticAreaLoadedClientPacketAfterClientAck(
         runtime,
         server_ack_sequence,
-        release_client_ack_sequence);
+        release_client_ack_sequence,
+        release_due_tick);
   } else {
     LogFormat(
         L"client->server synthetic Area_AreaLoaded deferred: proxy cannot observe successful EE Area_ClientArea dispatch after_seq=%u ack=%u",
@@ -22026,7 +26122,7 @@ bool IsFixedAreaResrefCandidateAt(
   return true;
 }
 
-std::wstring FormatAreaFixedResrefCandidates(
+std::wstring FormatAreaResrefScanCandidates(
     const std::vector<unsigned char>& payload,
     size_t fragment_offset) {
   constexpr size_t kPayloadHeaderBytes = 3;
@@ -22057,6 +26153,7 @@ std::wstring FormatAreaFixedResrefCandidates(
     summary += AsciiPreviewToWide(preview, 32);
     summary += L"'";
     ++logged;
+    offset += kCResRefTextBytes - 1;
   }
 
   if (summary.empty()) {
@@ -22139,22 +26236,33 @@ std::wstring FormatAreaLengthStringCandidates(
 }
 
 constexpr size_t kAreaPayloadHeaderBytes = 3;
-constexpr size_t kAreaWidthReadOffset = 162;
-constexpr size_t kAreaHeightReadOffset = 166;
-constexpr size_t kAreaTileSetReadOffset = 170;
-constexpr size_t kAreaFirstTileReadOffset = kAreaTileSetReadOffset + kCResRefTextBytes;
+constexpr size_t kAreaNameReadOffset = 44;
+constexpr size_t kAreaStaticWidthBytesAfterNameEnd = 96;
 constexpr uint32_t kMaxReasonableAreaDimension = 512;
 constexpr uint32_t kMaxReasonableAreaTileCount = 65536;
 
+struct AreaStaticLayout {
+  bool valid = false;
+  uint32_t area_name_length = 0;
+  std::string area_name;
+  size_t area_name_end_read_offset = 0;
+  size_t width_read_offset = 0;
+  size_t height_read_offset = 0;
+  size_t tileset_read_offset = 0;
+  size_t first_tile_read_offset = 0;
+  std::wstring failure_reason;
+};
+
 struct AreaTileStreamScan {
   bool valid = false;
+  AreaStaticLayout layout;
   uint32_t width = 0;
   uint32_t packet_height = 0;
   uint32_t inferred_height = 0;
   uint32_t tile_count = 0;
   uint32_t max_tile_id = 0;
-  size_t tile_start_read_offset = kAreaFirstTileReadOffset;
-  size_t tile_end_read_offset = kAreaFirstTileReadOffset;
+  size_t tile_start_read_offset = 0;
+  size_t tile_end_read_offset = 0;
   bool has_following_dword = false;
   uint32_t following_dword = 0;
   std::wstring stop_reason;
@@ -22197,6 +26305,131 @@ bool TryAreaReadU16(
     return false;
   }
   return TryReadU16LeFromBytes(payload, payload_offset, value);
+}
+
+bool TryAreaReadU8(
+    const std::vector<unsigned char>& payload,
+    size_t fragment_offset,
+    size_t read_offset,
+    unsigned char* value) {
+  const size_t payload_offset = kAreaPayloadHeaderBytes + read_offset;
+  if (payload_offset > fragment_offset || payload_offset >= payload.size()) {
+    if (value != nullptr) {
+      *value = 0;
+    }
+    return false;
+  }
+  if (value != nullptr) {
+    *value = payload[payload_offset];
+  }
+  return true;
+}
+
+bool TryAreaReadFloat(
+    const std::vector<unsigned char>& payload,
+    size_t fragment_offset,
+    size_t read_offset,
+    float* value) {
+  const size_t payload_offset = kAreaPayloadHeaderBytes + read_offset;
+  if (payload_offset > fragment_offset ||
+      fragment_offset - payload_offset < sizeof(float)) {
+    if (value != nullptr) {
+      *value = 0.0f;
+    }
+    return false;
+  }
+  return TryReadFloatLeFromBytes(payload, payload_offset, value);
+}
+
+bool TryAreaReadCExoString(
+    const std::vector<unsigned char>& payload,
+    size_t fragment_offset,
+    size_t read_offset,
+    uint32_t max_length,
+    std::string* value,
+    size_t* next_read_offset) {
+  if (value != nullptr) {
+    value->clear();
+  }
+  if (next_read_offset != nullptr) {
+    *next_read_offset = read_offset;
+  }
+
+  uint32_t length = 0;
+  if (!TryAreaReadU32(payload, fragment_offset, read_offset, &length) ||
+      length > max_length) {
+    return false;
+  }
+
+  const size_t string_read_offset = read_offset + sizeof(uint32_t);
+  const size_t string_payload_offset = kAreaPayloadHeaderBytes + string_read_offset;
+  if (string_payload_offset > fragment_offset ||
+      length > fragment_offset - string_payload_offset) {
+    return false;
+  }
+  for (uint32_t index = 0; index < length; ++index) {
+    if (!IsPrintableAreaStringByte(payload[string_payload_offset + index])) {
+      return false;
+    }
+  }
+  if (value != nullptr) {
+    value->assign(
+        reinterpret_cast<const char*>(payload.data() + string_payload_offset),
+        reinterpret_cast<const char*>(payload.data() + string_payload_offset + length));
+  }
+  if (next_read_offset != nullptr) {
+    *next_read_offset = string_read_offset + length;
+  }
+  return true;
+}
+
+bool TryGetAreaStaticLayout(
+    const std::vector<unsigned char>& payload,
+    size_t fragment_offset,
+    AreaStaticLayout* layout,
+    std::wstring* failure_reason) {
+  if (layout != nullptr) {
+    *layout = AreaStaticLayout{};
+  }
+  if (failure_reason != nullptr) {
+    failure_reason->clear();
+  }
+
+  std::string area_name;
+  size_t name_end = kAreaNameReadOffset;
+  if (!TryAreaReadCExoString(
+          payload,
+          fragment_offset,
+          kAreaNameReadOffset,
+          1024,
+          &area_name,
+          &name_end)) {
+    if (failure_reason != nullptr) {
+      *failure_reason = L"area name CExoString missing at read offset 44";
+    }
+    return false;
+  }
+
+  if (name_end > SIZE_MAX - kAreaStaticWidthBytesAfterNameEnd - kCResRefTextBytes) {
+    if (failure_reason != nullptr) {
+      *failure_reason = L"area static layout offset overflow";
+    }
+    return false;
+  }
+
+  AreaStaticLayout local;
+  local.valid = true;
+  local.area_name_length = static_cast<uint32_t>(area_name.size());
+  local.area_name = std::move(area_name);
+  local.area_name_end_read_offset = name_end;
+  local.width_read_offset = name_end + kAreaStaticWidthBytesAfterNameEnd;
+  local.height_read_offset = local.width_read_offset + sizeof(uint32_t);
+  local.tileset_read_offset = local.height_read_offset + sizeof(uint32_t);
+  local.first_tile_read_offset = local.tileset_read_offset + kCResRefTextBytes;
+  if (layout != nullptr) {
+    *layout = std::move(local);
+  }
+  return true;
 }
 
 size_t AreaTileRecordByteCount(uint16_t flags) {
@@ -22309,8 +26542,19 @@ AreaTileStreamScan ScanAreaTileStream(
     scan.stop_reason = L"fragment offset outside payload";
     return scan;
   }
-  if (!TryAreaReadU32(payload, fragment_offset, kAreaWidthReadOffset, &scan.width) ||
-      !TryAreaReadU32(payload, fragment_offset, kAreaHeightReadOffset, &scan.packet_height)) {
+
+  AreaStaticLayout layout;
+  std::wstring layout_failure;
+  if (!TryGetAreaStaticLayout(payload, fragment_offset, &layout, &layout_failure)) {
+    scan.stop_reason = layout_failure.empty() ? L"area static layout unavailable" : layout_failure;
+    return scan;
+  }
+  scan.layout = layout;
+  scan.tile_start_read_offset = layout.first_tile_read_offset;
+  scan.tile_end_read_offset = layout.first_tile_read_offset;
+
+  if (!TryAreaReadU32(payload, fragment_offset, layout.width_read_offset, &scan.width) ||
+      !TryAreaReadU32(payload, fragment_offset, layout.height_read_offset, &scan.packet_height)) {
     scan.stop_reason = L"missing width/height";
     return scan;
   }
@@ -22319,7 +26563,7 @@ AreaTileStreamScan ScanAreaTileStream(
     return scan;
   }
 
-  size_t cursor = kAreaFirstTileReadOffset;
+  size_t cursor = layout.first_tile_read_offset;
   while (scan.tile_count < kMaxReasonableAreaTileCount) {
     size_t record_length = 0;
     uint32_t tile_id = 0;
@@ -22374,6 +26618,19 @@ AreaTileStreamScan ScanAreaTileStream(
 
 std::wstring FormatAreaTileStreamScan(const AreaTileStreamScan& scan) {
   std::wstring summary = L"tile-scan ";
+  if (scan.layout.valid) {
+    wchar_t layout_cell[240]{};
+    swprintf_s(
+        layout_cell,
+        L"layout[name_len=%u name_end@%zu width@%zu height@%zu tileset@%zu tile0@%zu] ",
+        scan.layout.area_name_length,
+        scan.layout.area_name_end_read_offset,
+        scan.layout.width_read_offset,
+        scan.layout.height_read_offset,
+        scan.layout.tileset_read_offset,
+        scan.layout.first_tile_read_offset);
+    summary += layout_cell;
+  }
   if (!scan.valid) {
     summary += L"invalid";
     if (!scan.stop_reason.empty()) {
@@ -22398,6 +26655,753 @@ std::wstring FormatAreaTileStreamScan(const AreaTileStreamScan& scan) {
     summary += cell;
   }
   return summary;
+}
+
+std::wstring FormatAreaPostTileSectionDiagnostics(
+    const std::vector<unsigned char>& payload,
+    size_t fragment_offset) {
+  const AreaTileStreamScan scan = ScanAreaTileStream(payload, fragment_offset);
+  if (!scan.valid) {
+    return L"<tile-scan-invalid>";
+  }
+
+  std::wstring summary;
+  auto append = [&](const std::wstring& value) {
+    if (!summary.empty()) {
+      summary += L" ";
+    }
+    summary += value;
+  };
+  auto append_parse_failure = [&](const wchar_t* section, size_t cursor, const wchar_t* reason) {
+    wchar_t cell[240]{};
+    swprintf_s(
+        cell,
+        L"%s-parse=incomplete@%zu:%s",
+        section != nullptr ? section : L"section",
+        cursor,
+        reason != nullptr ? reason : L"unknown");
+    append(cell);
+  };
+
+  const size_t cursor = scan.tile_end_read_offset;
+  uint32_t transition_count = 0;
+  if (!TryAreaReadU32(payload, fragment_offset, cursor, &transition_count)) {
+    return L"<missing-post-tile-count>";
+  }
+
+  {
+    wchar_t cell[96]{};
+    swprintf_s(
+        cell,
+        L"transition-list@%zu count=%u/0x%08X",
+        cursor,
+        transition_count,
+        transition_count);
+    append(cell);
+  }
+
+  size_t entry_cursor = cursor + sizeof(uint32_t);
+  bool parsed_entries = transition_count <= 256;
+  const uint32_t logged_entries = std::min<uint32_t>(transition_count, 4);
+  for (uint32_t index = 0; parsed_entries && index < transition_count; ++index) {
+    uint32_t object_id = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    uint32_t name_length = 0;
+    const size_t name_length_offset =
+        entry_cursor + sizeof(uint32_t) + 3 * sizeof(float);
+    if (!TryAreaReadU32(payload, fragment_offset, entry_cursor, &object_id) ||
+        !TryAreaReadFloat(payload, fragment_offset, entry_cursor + sizeof(uint32_t), &x) ||
+        !TryAreaReadFloat(payload, fragment_offset, entry_cursor + sizeof(uint32_t) + sizeof(float), &y) ||
+        !TryAreaReadFloat(payload, fragment_offset, entry_cursor + sizeof(uint32_t) + 2 * sizeof(float), &z) ||
+        !TryAreaReadU32(payload, fragment_offset, name_length_offset, &name_length) ||
+        name_length > 256) {
+      parsed_entries = false;
+      break;
+    }
+    const size_t name_payload_offset =
+        kAreaPayloadHeaderBytes + name_length_offset + sizeof(uint32_t);
+    if (name_payload_offset > fragment_offset ||
+        name_length > fragment_offset - name_payload_offset) {
+      parsed_entries = false;
+      break;
+    }
+    bool printable_name = true;
+    for (uint32_t char_index = 0; char_index < name_length; ++char_index) {
+      if (!IsPrintableAreaStringByte(payload[name_payload_offset + char_index])) {
+        printable_name = false;
+        break;
+      }
+    }
+    if (!printable_name) {
+      parsed_entries = false;
+      break;
+    }
+
+    if (index < logged_entries) {
+      std::string name(
+          reinterpret_cast<const char*>(payload.data() + name_payload_offset),
+          reinterpret_cast<const char*>(payload.data() + name_payload_offset + name_length));
+      wchar_t entry[420]{};
+      swprintf_s(
+          entry,
+          L"entry%u@%zu id=0x%08X pos=[%.2f,%.2f,%.2f] name='%s'",
+          index,
+          entry_cursor,
+          object_id,
+          x,
+          y,
+          z,
+          AsciiPreviewToWide(name, 80).c_str());
+      append(entry);
+    }
+
+    entry_cursor = name_length_offset + sizeof(uint32_t) + name_length;
+  }
+
+  if (!parsed_entries) {
+    append_parse_failure(L"transition-list", entry_cursor, L"entry-shape");
+    return summary.empty() ? L"<none>" : summary;
+  }
+
+  {
+    wchar_t tail[96]{};
+    swprintf_s(
+        tail,
+        L"transition-list-end@%zu",
+        entry_cursor);
+    append(tail);
+  }
+
+  uint32_t map_pin_count = 0;
+  if (!TryAreaReadU32(payload, fragment_offset, entry_cursor, &map_pin_count)) {
+    append_parse_failure(L"map-pins", entry_cursor, L"missing-count");
+    return summary.empty() ? L"<none>" : summary;
+  }
+  {
+    wchar_t cell[96]{};
+    swprintf_s(cell, L"map-pins@%zu count=%u", entry_cursor, map_pin_count);
+    append(cell);
+  }
+  entry_cursor += sizeof(uint32_t);
+  if (map_pin_count > 256) {
+    append_parse_failure(L"map-pins", entry_cursor, L"count-too-large");
+    return summary.empty() ? L"<none>" : summary;
+  }
+  const uint32_t logged_map_pins = std::min<uint32_t>(map_pin_count, 3);
+  for (uint32_t index = 0; index < map_pin_count; ++index) {
+    const size_t pin_start = entry_cursor;
+    uint32_t pin_id = 0;
+    std::string label;
+    size_t after_label = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    if (!TryAreaReadU32(payload, fragment_offset, entry_cursor, &pin_id) ||
+        !TryAreaReadCExoString(
+            payload,
+            fragment_offset,
+            entry_cursor + sizeof(uint32_t),
+            256,
+            &label,
+            &after_label) ||
+        !TryAreaReadFloat(payload, fragment_offset, after_label, &x) ||
+        !TryAreaReadFloat(payload, fragment_offset, after_label + sizeof(float), &y) ||
+        !TryAreaReadFloat(payload, fragment_offset, after_label + 2 * sizeof(float), &z)) {
+      append_parse_failure(L"map-pins", pin_start, L"entry-shape");
+      return summary.empty() ? L"<none>" : summary;
+    }
+    if (index < logged_map_pins) {
+      wchar_t cell[360]{};
+      swprintf_s(
+          cell,
+          L"pin%u@%zu id=%u label='%s' pos=[%.2f,%.2f,%.2f]",
+          index,
+          pin_start,
+          pin_id,
+          AsciiPreviewToWide(label, 80).c_str(),
+          x,
+          y,
+          z);
+      append(cell);
+    }
+    entry_cursor = after_label + 3 * sizeof(float);
+  }
+
+  uint16_t sound_count = 0;
+  if (!TryAreaReadU16(payload, fragment_offset, entry_cursor, &sound_count)) {
+    append_parse_failure(L"sounds", entry_cursor, L"missing-count");
+    return summary.empty() ? L"<none>" : summary;
+  }
+  {
+    wchar_t cell[96]{};
+    swprintf_s(cell, L"sounds@%zu count=%u", entry_cursor, static_cast<unsigned int>(sound_count));
+    append(cell);
+  }
+  entry_cursor += sizeof(uint16_t);
+  if (sound_count > 1024) {
+    append_parse_failure(L"sounds", entry_cursor, L"count-too-large");
+    return summary.empty() ? L"<none>" : summary;
+  }
+  const uint16_t logged_sounds = std::min<uint16_t>(sound_count, 4);
+  for (uint16_t index = 0; index < sound_count; ++index) {
+    constexpr size_t kAreaSoundResrefCountOffset = 52;
+    constexpr size_t kAreaSoundBaseBytes = 54;
+    const size_t sound_start = entry_cursor;
+    uint32_t object_id = 0;
+    unsigned char byte0 = 0;
+    unsigned char byte1 = 0;
+    unsigned char byte2 = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    uint16_t resref_count = 0;
+    if (!TryAreaReadU32(payload, fragment_offset, sound_start, &object_id) ||
+        !TryAreaReadU8(payload, fragment_offset, sound_start + 4, &byte0) ||
+        !TryAreaReadU8(payload, fragment_offset, sound_start + 5, &byte1) ||
+        !TryAreaReadU8(payload, fragment_offset, sound_start + 6, &byte2) ||
+        !TryAreaReadFloat(payload, fragment_offset, sound_start + 40, &x) ||
+        !TryAreaReadFloat(payload, fragment_offset, sound_start + 44, &y) ||
+        !TryAreaReadFloat(payload, fragment_offset, sound_start + 48, &z) ||
+        !TryAreaReadU16(payload, fragment_offset, sound_start + kAreaSoundResrefCountOffset, &resref_count)) {
+      append_parse_failure(L"sounds", sound_start, L"entry-header");
+      return summary.empty() ? L"<none>" : summary;
+    }
+    if (resref_count > 64) {
+      append_parse_failure(L"sounds", sound_start, L"resref-count-too-large");
+      return summary.empty() ? L"<none>" : summary;
+    }
+    const size_t refs_start = sound_start + kAreaSoundBaseBytes;
+    const size_t sound_end = refs_start + static_cast<size_t>(resref_count) * kCResRefTextBytes;
+    if (kAreaPayloadHeaderBytes + sound_end > fragment_offset) {
+      append_parse_failure(L"sounds", sound_start, L"resrefs-truncated");
+      return summary.empty() ? L"<none>" : summary;
+    }
+    if (index < logged_sounds) {
+      std::wstring refs;
+      const uint16_t logged_refs = std::min<uint16_t>(resref_count, 4);
+      for (uint16_t ref_index = 0; ref_index < logged_refs; ++ref_index) {
+        if (!refs.empty()) {
+          refs += L",";
+        }
+        const size_t ref_payload_offset =
+            kAreaPayloadHeaderBytes + refs_start + static_cast<size_t>(ref_index) * kCResRefTextBytes;
+        refs += AsciiPreviewToWide(
+            FixedResrefPreview(payload.data() + ref_payload_offset, kCResRefTextBytes),
+            32);
+      }
+      if (resref_count > logged_refs) {
+        refs += L",...";
+      }
+      wchar_t cell[520]{};
+      swprintf_s(
+          cell,
+          L"sound%u@%zu id=0x%08X bytes=[%02X %02X %02X] pos?=[%.2f,%.2f,%.2f] refs=%u[%s]",
+          static_cast<unsigned int>(index),
+          sound_start,
+          object_id,
+          static_cast<unsigned int>(byte0),
+          static_cast<unsigned int>(byte1),
+          static_cast<unsigned int>(byte2),
+          x,
+          y,
+          z,
+          static_cast<unsigned int>(resref_count),
+          refs.empty() ? L"<none>" : refs.c_str());
+      append(cell);
+    }
+    entry_cursor = sound_end;
+  }
+
+  uint16_t placeable_light_count = 0;
+  if (!TryAreaReadU16(payload, fragment_offset, entry_cursor, &placeable_light_count)) {
+    append_parse_failure(L"placeable-lights", entry_cursor, L"missing-count");
+    return summary.empty() ? L"<none>" : summary;
+  }
+  {
+    wchar_t cell[120]{};
+    swprintf_s(
+        cell,
+        L"placeable-lights@%zu count=%u",
+        entry_cursor,
+        static_cast<unsigned int>(placeable_light_count));
+    append(cell);
+  }
+  entry_cursor += sizeof(uint16_t);
+  if (placeable_light_count > 4096) {
+    append_parse_failure(L"placeable-lights", entry_cursor, L"count-too-large");
+    return summary.empty() ? L"<none>" : summary;
+  }
+  std::vector<uint32_t> placeable_light_ids;
+  placeable_light_ids.reserve(placeable_light_count);
+  const uint16_t logged_lights = std::min<uint16_t>(placeable_light_count, 4);
+  for (uint16_t index = 0; index < placeable_light_count; ++index) {
+    const size_t light_start = entry_cursor;
+    uint32_t object_id = 0;
+    uint16_t appearance = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    if (!TryAreaReadU32(payload, fragment_offset, light_start, &object_id) ||
+        !TryAreaReadU16(payload, fragment_offset, light_start + sizeof(uint32_t), &appearance) ||
+        !TryAreaReadFloat(payload, fragment_offset, light_start + 6, &x) ||
+        !TryAreaReadFloat(payload, fragment_offset, light_start + 10, &y) ||
+        !TryAreaReadFloat(payload, fragment_offset, light_start + 14, &z)) {
+      append_parse_failure(L"placeable-lights", light_start, L"entry-shape");
+      return summary.empty() ? L"<none>" : summary;
+    }
+    placeable_light_ids.push_back(object_id);
+    if (index < logged_lights) {
+      wchar_t cell[260]{};
+      swprintf_s(
+          cell,
+          L"light%u@%zu id=0x%08X app=%u pos=[%.2f,%.2f,%.2f]",
+          static_cast<unsigned int>(index),
+          light_start,
+          object_id,
+          static_cast<unsigned int>(appearance),
+          x,
+          y,
+          z);
+      append(cell);
+    }
+    entry_cursor += sizeof(uint32_t) + sizeof(uint16_t) + 3 * sizeof(float);
+  }
+
+  uint16_t static_placeable_count = 0;
+  if (!TryAreaReadU16(payload, fragment_offset, entry_cursor, &static_placeable_count)) {
+    append_parse_failure(L"static-placeables", entry_cursor, L"missing-count");
+    return summary.empty() ? L"<none>" : summary;
+  }
+  {
+    wchar_t cell[120]{};
+    swprintf_s(
+        cell,
+        L"static-placeables@%zu count=%u",
+        entry_cursor,
+        static_cast<unsigned int>(static_placeable_count));
+    append(cell);
+  }
+  entry_cursor += sizeof(uint16_t);
+  if (static_placeable_count > 4096) {
+    append_parse_failure(L"static-placeables", entry_cursor, L"count-too-large");
+    return summary.empty() ? L"<none>" : summary;
+  }
+  std::vector<uint32_t> static_placeable_ids;
+  static_placeable_ids.reserve(static_placeable_count);
+  const uint16_t logged_static = std::min<uint16_t>(static_placeable_count, 4);
+  for (uint16_t index = 0; index < static_placeable_count; ++index) {
+    const size_t static_start = entry_cursor;
+    uint32_t object_id = 0;
+    uint16_t appearance = 0;
+    std::array<float, 6> values{};
+    bool ok = TryAreaReadU32(payload, fragment_offset, static_start, &object_id) &&
+        TryAreaReadU16(payload, fragment_offset, static_start + sizeof(uint32_t), &appearance);
+    for (size_t value_index = 0; ok && value_index < values.size(); ++value_index) {
+      ok = TryAreaReadFloat(
+          payload,
+          fragment_offset,
+          static_start + sizeof(uint32_t) + sizeof(uint16_t) +
+              value_index * sizeof(float),
+          &values[value_index]);
+    }
+    if (!ok) {
+      append_parse_failure(L"static-placeables", static_start, L"entry-shape");
+      return summary.empty() ? L"<none>" : summary;
+    }
+    static_placeable_ids.push_back(object_id);
+    if (index < logged_static) {
+      wchar_t cell[360]{};
+      swprintf_s(
+          cell,
+          L"static%u@%zu id=0x%08X app=%u pos=[%.2f,%.2f,%.2f] dir=[%.3f,%.3f,%.3f]",
+          static_cast<unsigned int>(index),
+          static_start,
+          object_id,
+          static_cast<unsigned int>(appearance),
+          values[0],
+          values[1],
+          values[2],
+          values[3],
+          values[4],
+          values[5]);
+      append(cell);
+    }
+    entry_cursor += sizeof(uint32_t) + sizeof(uint16_t) + 6 * sizeof(float);
+  }
+
+  auto count_duplicate_entries = [](std::vector<uint32_t> ids) -> size_t {
+    if (ids.empty()) {
+      return 0;
+    }
+    std::sort(ids.begin(), ids.end());
+    size_t duplicates = 0;
+    uint32_t previous = ids[0];
+    for (size_t index = 1; index < ids.size(); ++index) {
+      if (ids[index] == previous) {
+        ++duplicates;
+      } else {
+        previous = ids[index];
+      }
+    }
+    return duplicates;
+  };
+  auto count_unique_overlap =
+      [](std::vector<uint32_t> left, std::vector<uint32_t> right) -> size_t {
+    if (left.empty() || right.empty()) {
+      return 0;
+    }
+    std::sort(left.begin(), left.end());
+    std::sort(right.begin(), right.end());
+    left.erase(std::unique(left.begin(), left.end()), left.end());
+    right.erase(std::unique(right.begin(), right.end()), right.end());
+    size_t left_index = 0;
+    size_t right_index = 0;
+    size_t overlap = 0;
+    while (left_index < left.size() && right_index < right.size()) {
+      if (left[left_index] == right[right_index]) {
+        ++overlap;
+        ++left_index;
+        ++right_index;
+      } else if (left[left_index] < right[right_index]) {
+        ++left_index;
+      } else {
+        ++right_index;
+      }
+    }
+    return overlap;
+  };
+  {
+    wchar_t cell[200]{};
+    swprintf_s(
+        cell,
+        L"static-placeable-check static_dups=%zu light_dups=%zu light_static_overlap=%zu",
+        count_duplicate_entries(static_placeable_ids),
+        count_duplicate_entries(placeable_light_ids),
+        count_unique_overlap(placeable_light_ids, static_placeable_ids));
+    append(cell);
+  }
+
+  for (size_t section_index = 0; section_index < 2; ++section_index) {
+    uint16_t count = 0;
+    if (!TryAreaReadU16(payload, fragment_offset, entry_cursor, &count)) {
+      append_parse_failure(
+          section_index == 0 ? L"post-static-a" : L"post-static-b",
+          entry_cursor,
+          L"missing-count");
+      return summary.empty() ? L"<none>" : summary;
+    }
+    wchar_t cell[120]{};
+    swprintf_s(
+        cell,
+        L"post-static-%c@%zu count=%u",
+        section_index == 0 ? L'a' : L'b',
+        entry_cursor,
+        static_cast<unsigned int>(count));
+    append(cell);
+    entry_cursor += sizeof(uint16_t);
+    if (section_index == 0 && count <= 256) {
+      const size_t bytes = static_cast<size_t>(count) * (sizeof(uint32_t) + sizeof(uint16_t));
+      if (kAreaPayloadHeaderBytes + entry_cursor + bytes > fragment_offset) {
+        append_parse_failure(L"post-static-a", entry_cursor, L"entries-truncated");
+        return summary.empty() ? L"<none>" : summary;
+      }
+      entry_cursor += bytes;
+    } else if (count != 0) {
+      append(L"post-static-nonzero=unparsed");
+      break;
+    }
+  }
+
+  {
+    wchar_t tail[160]{};
+    const size_t read_buffer_limit =
+        fragment_offset >= kAreaPayloadHeaderBytes ? fragment_offset - kAreaPayloadHeaderBytes : 0;
+    const size_t unread = entry_cursor <= read_buffer_limit ? read_buffer_limit - entry_cursor : 0;
+    swprintf_s(
+        tail,
+        L"post-tile-end@%zu read-limit@%zu unread_before_frag=%zu",
+        entry_cursor,
+        read_buffer_limit,
+        unread);
+    append(tail);
+  }
+
+  return summary.empty() ? L"<none>" : summary;
+}
+
+std::wstring FormatAreaObjectIdPreview(const std::vector<uint32_t>& ids, size_t max_count) {
+  if (ids.empty()) {
+    return L"<none>";
+  }
+  std::wstring text;
+  const size_t count = std::min(ids.size(), max_count);
+  for (size_t index = 0; index < count; ++index) {
+    if (index != 0) {
+      text += L",";
+    }
+    wchar_t cell[32]{};
+    swprintf_s(cell, L"0x%08X", ids[index]);
+    text += cell;
+  }
+  if (ids.size() > count) {
+    text += L",...";
+  }
+  return text;
+}
+
+std::wstring FormatAreaPlaceableContextRowsPreview(
+    const std::vector<AreaPlaceableContextRow>& rows,
+    size_t max_count) {
+  if (rows.empty()) {
+    return L"<none>";
+  }
+  std::wstring text;
+  const size_t count = std::min(rows.size(), max_count);
+  for (size_t index = 0; index < count; ++index) {
+    if (index != 0) {
+      text += L",";
+    }
+    const AreaPlaceableContextRow& row = rows[index];
+    wchar_t cell[240]{};
+    if (row.has_direction) {
+      swprintf_s(
+          cell,
+          L"0x%08X/app=%u@(%.2f,%.2f,%.2f)dir=[%.3f,%.3f,%.3f]",
+          row.object_id,
+          static_cast<unsigned int>(row.appearance),
+          static_cast<double>(row.x),
+          static_cast<double>(row.y),
+          static_cast<double>(row.z),
+          static_cast<double>(row.dir_x),
+          static_cast<double>(row.dir_y),
+          static_cast<double>(row.dir_z));
+    } else {
+      swprintf_s(
+          cell,
+          L"0x%08X/app=%u@(%.2f,%.2f,%.2f)",
+          row.object_id,
+          static_cast<unsigned int>(row.appearance),
+          static_cast<double>(row.x),
+          static_cast<double>(row.y),
+          static_cast<double>(row.z));
+    }
+    text += cell;
+  }
+  if (rows.size() > count) {
+    text += L",...";
+  }
+  return text;
+}
+
+bool CollectAreaPostTilePlaceableIds(
+    const std::vector<unsigned char>& payload,
+    size_t fragment_offset,
+    std::vector<uint32_t>* light_ids,
+    std::vector<uint32_t>* static_ids,
+    std::vector<AreaPlaceableContextRow>* light_rows,
+    std::vector<AreaPlaceableContextRow>* static_rows,
+    std::wstring* failure_reason) {
+  if (light_ids != nullptr) {
+    light_ids->clear();
+  }
+  if (static_ids != nullptr) {
+    static_ids->clear();
+  }
+  if (light_rows != nullptr) {
+    light_rows->clear();
+  }
+  if (static_rows != nullptr) {
+    static_rows->clear();
+  }
+  if (failure_reason != nullptr) {
+    failure_reason->clear();
+  }
+
+  const AreaTileStreamScan scan = ScanAreaTileStream(payload, fragment_offset);
+  if (!scan.valid) {
+    if (failure_reason != nullptr) {
+      *failure_reason = FormatAreaTileStreamScan(scan);
+    }
+    return false;
+  }
+
+  size_t cursor = scan.tile_end_read_offset;
+  uint32_t transition_count = 0;
+  if (!TryAreaReadU32(payload, fragment_offset, cursor, &transition_count) ||
+      transition_count > 4096) {
+    if (failure_reason != nullptr) {
+      *failure_reason = L"transition-list count unavailable";
+    }
+    return false;
+  }
+  cursor += sizeof(uint32_t);
+  for (uint32_t index = 0; index < transition_count; ++index) {
+    if (cursor > SIZE_MAX - sizeof(uint32_t) - 3 * sizeof(float)) {
+      return false;
+    }
+    const size_t name_offset = cursor + sizeof(uint32_t) + 3 * sizeof(float);
+    size_t after_name = 0;
+    if (!TryAreaReadCExoString(payload, fragment_offset, name_offset, 1024, nullptr, &after_name)) {
+      if (failure_reason != nullptr) {
+        *failure_reason = L"transition-list entry shape";
+      }
+      return false;
+    }
+    cursor = after_name;
+  }
+
+  uint32_t map_pin_count = 0;
+  if (!TryAreaReadU32(payload, fragment_offset, cursor, &map_pin_count) ||
+      map_pin_count > 4096) {
+    if (failure_reason != nullptr) {
+      *failure_reason = L"map-pin count unavailable";
+    }
+    return false;
+  }
+  cursor += sizeof(uint32_t);
+  for (uint32_t index = 0; index < map_pin_count; ++index) {
+    size_t after_label = 0;
+    if (!TryAreaReadCExoString(
+            payload,
+            fragment_offset,
+            cursor + sizeof(uint32_t),
+            1024,
+            nullptr,
+            &after_label) ||
+        after_label > SIZE_MAX - 3 * sizeof(float)) {
+      if (failure_reason != nullptr) {
+        *failure_reason = L"map-pin entry shape";
+      }
+      return false;
+    }
+    cursor = after_label + 3 * sizeof(float);
+  }
+
+  uint16_t sound_count = 0;
+  if (!TryAreaReadU16(payload, fragment_offset, cursor, &sound_count)) {
+    if (failure_reason != nullptr) {
+      *failure_reason = L"sound count unavailable";
+    }
+    return false;
+  }
+  cursor += sizeof(uint16_t);
+  for (uint16_t index = 0; index < sound_count; ++index) {
+    constexpr size_t kAreaSoundResrefCountOffset = 52;
+    constexpr size_t kAreaSoundBaseBytes = 54;
+    uint16_t resref_count = 0;
+    if (!TryAreaReadU16(payload, fragment_offset, cursor + kAreaSoundResrefCountOffset, &resref_count) ||
+        resref_count > 64) {
+      if (failure_reason != nullptr) {
+        *failure_reason = L"sound entry shape";
+      }
+      return false;
+    }
+    const size_t bytes =
+        kAreaSoundBaseBytes + static_cast<size_t>(resref_count) * kCResRefTextBytes;
+    if (bytes > SIZE_MAX - cursor ||
+        kAreaPayloadHeaderBytes + cursor + bytes > fragment_offset) {
+      if (failure_reason != nullptr) {
+        *failure_reason = L"sound entry truncated";
+      }
+      return false;
+    }
+    cursor += bytes;
+  }
+
+  uint16_t light_count = 0;
+  if (!TryAreaReadU16(payload, fragment_offset, cursor, &light_count)) {
+    if (failure_reason != nullptr) {
+      *failure_reason = L"placeable-light count unavailable";
+    }
+    return false;
+  }
+  cursor += sizeof(uint16_t);
+  if (light_ids != nullptr) {
+    light_ids->reserve(light_count);
+  }
+  if (light_rows != nullptr) {
+    light_rows->reserve(light_count);
+  }
+  for (uint16_t index = 0; index < light_count; ++index) {
+    uint32_t object_id = 0;
+    uint16_t appearance = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    if (!TryAreaReadU32(payload, fragment_offset, cursor, &object_id) ||
+        !TryAreaReadU16(payload, fragment_offset, cursor + sizeof(uint32_t), &appearance) ||
+        !TryAreaReadFloat(payload, fragment_offset, cursor + 6, &x) ||
+        !TryAreaReadFloat(payload, fragment_offset, cursor + 10, &y) ||
+        !TryAreaReadFloat(payload, fragment_offset, cursor + 14, &z)) {
+      if (failure_reason != nullptr) {
+        *failure_reason = L"placeable-light entry shape";
+      }
+      return false;
+    }
+    if (light_ids != nullptr) {
+      light_ids->push_back(object_id);
+    }
+    if (light_rows != nullptr) {
+      light_rows->push_back({object_id, appearance, x, y, z, 0.0f, 0.0f, 0.0f, false});
+    }
+    cursor += sizeof(uint32_t) + sizeof(uint16_t) + 3 * sizeof(float);
+  }
+
+  uint16_t static_count = 0;
+  if (!TryAreaReadU16(payload, fragment_offset, cursor, &static_count)) {
+    if (failure_reason != nullptr) {
+      *failure_reason = L"static-placeable count unavailable";
+    }
+    return false;
+  }
+  cursor += sizeof(uint16_t);
+  if (static_ids != nullptr) {
+    static_ids->reserve(static_count);
+  }
+  if (static_rows != nullptr) {
+    static_rows->reserve(static_count);
+  }
+  for (uint16_t index = 0; index < static_count; ++index) {
+    uint32_t object_id = 0;
+    uint16_t appearance = 0;
+    std::array<float, 6> values{};
+    bool ok = TryAreaReadU32(payload, fragment_offset, cursor, &object_id) &&
+        TryAreaReadU16(payload, fragment_offset, cursor + sizeof(uint32_t), &appearance);
+    for (size_t value_index = 0; ok && value_index < values.size(); ++value_index) {
+      ok = TryAreaReadFloat(
+          payload,
+          fragment_offset,
+          cursor + sizeof(uint32_t) + sizeof(uint16_t) +
+              value_index * sizeof(float),
+          &values[value_index]);
+    }
+    if (!ok) {
+      if (failure_reason != nullptr) {
+        *failure_reason = L"static-placeable entry shape";
+      }
+      return false;
+    }
+    if (static_ids != nullptr) {
+      static_ids->push_back(object_id);
+    }
+    if (static_rows != nullptr) {
+      static_rows->push_back(
+          {object_id,
+           appearance,
+           values[0],
+           values[1],
+           values[2],
+           values[3],
+           values[4],
+           values[5],
+           true});
+    }
+    cursor += sizeof(uint32_t) + sizeof(uint16_t) + 6 * sizeof(float);
+  }
+
+  return true;
 }
 
 bool RepairMissingAreaHeightFromTileStream(
@@ -22438,20 +27442,15 @@ bool RepairMissingAreaHeightFromTileStream(
   }
   return TryWriteU32LeToBytes(
       payload,
-      kAreaPayloadHeaderBytes + kAreaHeightReadOffset,
+      kAreaPayloadHeaderBytes + scan.layout.height_read_offset,
       scan.inferred_height);
 }
 
 std::wstring FormatAreaClientAreaStaticHeader(
     const std::vector<unsigned char>& payload,
     size_t fragment_offset) {
-  constexpr size_t kPreDimensionBytesOffset = 156;
   constexpr size_t kPreDimensionBytesLength = 6;
-  constexpr size_t kFirstTileOffset = kAreaTileSetReadOffset + kCResRefTextBytes;
-  constexpr size_t kFirstTileOrientationOffset = kFirstTileOffset + sizeof(uint32_t);
-  constexpr size_t kFirstTileThirdIntOffset = kFirstTileOrientationOffset + sizeof(uint32_t);
-  constexpr size_t kFirstTileFlagsOffset = kFirstTileThirdIntOffset + sizeof(uint32_t);
-  constexpr size_t kRawPreviewOffset = 144;
+  constexpr size_t kFallbackRawPreviewOffset = 144;
   constexpr size_t kRawPreviewBytes = 80;
 
   auto has_read_buffer_bytes = [&](size_t read_buffer_offset, size_t length) {
@@ -22489,26 +27488,61 @@ std::wstring FormatAreaClientAreaStaticHeader(
     append(part);
   };
 
-  if (has_read_buffer_bytes(kPreDimensionBytesOffset, kPreDimensionBytesLength)) {
+  AreaStaticLayout layout;
+  std::wstring layout_failure;
+  const bool have_layout = TryGetAreaStaticLayout(payload, fragment_offset, &layout, &layout_failure);
+  if (have_layout) {
+    wchar_t name_cell[260]{};
+    swprintf_s(
+        name_cell,
+        L"name@44[%u]='%s' end@%zu",
+        layout.area_name_length,
+        AsciiPreviewToWide(layout.area_name, 80).c_str(),
+        layout.area_name_end_read_offset);
+    append(name_cell);
+  } else {
     append(
-        L"pre-dim@156=[" +
+        L"layout=<" +
+        (layout_failure.empty() ? std::wstring(L"unavailable") : layout_failure) +
+        L">");
+  }
+
+  const size_t pre_dimension_bytes_offset =
+      have_layout && layout.width_read_offset >= kPreDimensionBytesLength
+          ? layout.width_read_offset - kPreDimensionBytesLength
+          : 156;
+  if (has_read_buffer_bytes(pre_dimension_bytes_offset, kPreDimensionBytesLength)) {
+    append(
+        L"pre-dim@" +
+        std::to_wstring(pre_dimension_bytes_offset) +
+        L"=[" +
         FormatLimitedBytes(
-            payload.data() + payload_offset_for(kPreDimensionBytesOffset),
+            payload.data() + payload_offset_for(pre_dimension_bytes_offset),
             kPreDimensionBytesLength,
             kPreDimensionBytesLength) +
         L"]");
   } else {
-    append(L"pre-dim@156=<unavailable>");
+    append(L"pre-dim@" + std::to_wstring(pre_dimension_bytes_offset) + L"=<unavailable>");
   }
 
-  append_u32(L"width", kAreaWidthReadOffset);
-  append_u32(L"height", kAreaHeightReadOffset);
+  const size_t width_read_offset = have_layout ? layout.width_read_offset : 162;
+  const size_t height_read_offset = have_layout ? layout.height_read_offset : 166;
+  const size_t tileset_read_offset = have_layout ? layout.tileset_read_offset : 170;
+  const size_t first_tile_offset =
+      have_layout ? layout.first_tile_read_offset : tileset_read_offset + kCResRefTextBytes;
+  const size_t first_tile_orientation_offset = first_tile_offset + sizeof(uint32_t);
+  const size_t first_tile_third_int_offset = first_tile_orientation_offset + sizeof(uint32_t);
+  const size_t first_tile_flags_offset = first_tile_third_int_offset + sizeof(uint32_t);
+  append_u32(L"width", width_read_offset);
+  append_u32(L"height", height_read_offset);
 
-  std::wstring tileset_part = L"tileset@170='";
-  if (has_read_buffer_bytes(kAreaTileSetReadOffset, kCResRefTextBytes)) {
+  std::wstring tileset_part = L"tileset@";
+  tileset_part += std::to_wstring(tileset_read_offset);
+  tileset_part += L"='";
+  if (has_read_buffer_bytes(tileset_read_offset, kCResRefTextBytes)) {
     const std::string tileset =
         FixedResrefPreview(
-            payload.data() + payload_offset_for(kAreaTileSetReadOffset),
+            payload.data() + payload_offset_for(tileset_read_offset),
             kCResRefTextBytes);
     tileset_part += tileset.empty() ? L"<empty>" : AsciiPreviewToWide(tileset, 32);
   } else {
@@ -22517,14 +27551,16 @@ std::wstring FormatAreaClientAreaStaticHeader(
   tileset_part += L"'";
   append(tileset_part);
 
-  append_u32(L"tile0-id", kFirstTileOffset);
-  append_u32(L"tile0-orient", kFirstTileOrientationOffset);
-  append_u32(L"tile0-third", kFirstTileThirdIntOffset);
+  append_u32(L"tile0-id", first_tile_offset);
+  append_u32(L"tile0-orient", first_tile_orientation_offset);
+  append_u32(L"tile0-third", first_tile_third_int_offset);
 
-  std::wstring flags_part = L"tile0-flags@198=";
+  std::wstring flags_part = L"tile0-flags@";
+  flags_part += std::to_wstring(first_tile_flags_offset);
+  flags_part += L"=";
   uint16_t flags = 0;
-  if (has_read_buffer_bytes(kFirstTileFlagsOffset, sizeof(uint16_t)) &&
-      TryReadU16LeFromBytes(payload, payload_offset_for(kFirstTileFlagsOffset), &flags)) {
+  if (has_read_buffer_bytes(first_tile_flags_offset, sizeof(uint16_t)) &&
+      TryReadU16LeFromBytes(payload, payload_offset_for(first_tile_flags_offset), &flags)) {
     wchar_t cell[64]{};
     swprintf_s(cell, L"%u/0x%04X", static_cast<unsigned int>(flags), static_cast<unsigned int>(flags));
     flags_part += cell;
@@ -22533,13 +27569,19 @@ std::wstring FormatAreaClientAreaStaticHeader(
   }
   append(flags_part);
 
-  if (has_read_buffer_bytes(kRawPreviewOffset, 1)) {
-    const size_t payload_offset = payload_offset_for(kRawPreviewOffset);
+  const size_t raw_preview_offset =
+      have_layout && layout.width_read_offset >= 18
+          ? layout.width_read_offset - 18
+          : kFallbackRawPreviewOffset;
+  if (has_read_buffer_bytes(raw_preview_offset, 1)) {
+    const size_t payload_offset = payload_offset_for(raw_preview_offset);
     const size_t available = std::min(
         kRawPreviewBytes,
         std::min(payload.size(), fragment_offset) - payload_offset);
     append(
-        L"raw@144=[" +
+        L"raw@" +
+        std::to_wstring(raw_preview_offset) +
+        L"=[" +
         FormatLimitedBytes(payload.data() + payload_offset, available, kRawPreviewBytes) +
         L"]");
   }
@@ -22592,7 +27634,7 @@ void LogAreaClientAreaDiagnostics(
       : 0;
 
   LogFormat(
-      L"%s Area_ClientArea diagnostics: declared=%u byte_read_size=%zu fragment_offset=%zu fragment_size=%zu transition=%u floats=[%s%.3f,%s%.3f,%s%.3f,%s%.3f] legacy_object=0x%08X legacy_resref='%s' ee_object_at+%zu=%s0x%08X ee_resref_at+%zu='%s' first_fragment=0x%02X->0x%02X static=[%s] fixed_resrefs=[%s] strings=[%s] read_tail=[%s] fragments=[%s]",
+      L"%s Area_ClientArea diagnostics: declared=%u byte_read_size=%zu fragment_offset=%zu fragment_size=%zu transition=%u floats=[%s%.3f,%s%.3f,%s%.3f,%s%.3f] legacy_object=0x%08X legacy_resref='%s' ee_object_at+%zu=%s0x%08X ee_resref_at+%zu='%s' first_fragment=0x%02X->0x%02X static=[%s] post_tile=[%s] resref_scan=[%s] strings=[%s] read_tail=[%s] fragments=[%s]",
       context != nullptr ? context : L"server->client",
       declared,
       declared >= kPayloadHeaderBytes ? static_cast<size_t>(declared - kPayloadHeaderBytes) : 0,
@@ -22617,7 +27659,8 @@ void LogAreaClientAreaDiagnostics(
       static_cast<unsigned int>(old_fragment_byte),
       static_cast<unsigned int>(new_fragment_byte),
       FormatAreaClientAreaStaticHeader(payload, fragment_offset).c_str(),
-      FormatAreaFixedResrefCandidates(payload, fragment_offset).c_str(),
+      FormatAreaPostTileSectionDiagnostics(payload, fragment_offset).c_str(),
+      FormatAreaResrefScanCandidates(payload, fragment_offset).c_str(),
       FormatAreaLengthStringCandidates(payload, fragment_offset).c_str(),
       tail_length != 0 ? FormatLimitedBytes(payload.data() + tail_start, tail_length, 48).c_str() : L"<none>",
       fragment_preview_length != 0
@@ -22748,6 +27791,54 @@ bool RewriteAreaClientAreaPayloadIfPossible(
       0);
   WriteU32Le(payload->data() + 3, new_declared);
   (*payload)[new_fragment_offset] = new_fragment_byte;
+  std::vector<uint32_t> area_light_ids;
+  std::vector<uint32_t> area_static_ids;
+  std::vector<AreaPlaceableContextRow> area_light_rows;
+  std::vector<AreaPlaceableContextRow> area_static_rows;
+  std::wstring area_context_failure;
+  if (CollectAreaPostTilePlaceableIds(
+          *payload,
+          new_fragment_offset,
+          &area_light_ids,
+          &area_static_ids,
+          &area_light_rows,
+          &area_static_rows,
+          &area_context_failure)) {
+    runtime->latest_area_resref = area_resref;
+    runtime->latest_area_placeable_light_ids = std::move(area_light_ids);
+    runtime->latest_area_static_placeable_ids = std::move(area_static_ids);
+    runtime->latest_area_placeable_light_rows = std::move(area_light_rows);
+    runtime->latest_area_static_placeable_rows = std::move(area_static_rows);
+    runtime->latest_live_placeable_add_rows.clear();
+    runtime->latest_live_object_lifecycle_rows.clear();
+    LogFormat(
+        L"%s Area_ClientArea placeable context captured: area='%s' lights=%zu static=%zu live_lifecycle_reset=1 light_ids=[%s] static_ids=[%s] light_rows=[%s] static_rows=[%s]",
+        context != nullptr ? context : L"server->client",
+        AsciiPreviewToWide(runtime->latest_area_resref, 32).c_str(),
+        runtime->latest_area_placeable_light_ids.size(),
+        runtime->latest_area_static_placeable_ids.size(),
+        FormatAreaObjectIdPreview(runtime->latest_area_placeable_light_ids, 8).c_str(),
+        FormatAreaObjectIdPreview(runtime->latest_area_static_placeable_ids, 12).c_str(),
+        FormatAreaPlaceableContextRowsPreview(
+            runtime->latest_area_placeable_light_rows,
+            6).c_str(),
+        FormatAreaPlaceableContextRowsPreview(
+            runtime->latest_area_static_placeable_rows,
+            8).c_str());
+  } else {
+    runtime->latest_area_resref.clear();
+    runtime->latest_area_placeable_light_ids.clear();
+    runtime->latest_area_static_placeable_ids.clear();
+    runtime->latest_area_placeable_light_rows.clear();
+    runtime->latest_area_static_placeable_rows.clear();
+    runtime->latest_live_placeable_add_rows.clear();
+    runtime->latest_live_object_lifecycle_rows.clear();
+    LogFormat(
+        L"%s Area_ClientArea placeable context skipped: area='%s' live_lifecycle_reset=1 reason=%s",
+        context != nullptr ? context : L"server->client",
+        AsciiPreviewToWide(area_resref, 32).c_str(),
+        area_context_failure.empty() ? L"<unknown>" : area_context_failure.c_str());
+  }
   ++runtime->area_client_area_rewrite_count;
   LogFormat(
       L"%s Area_ClientArea object/name/tail rewritten #%llu/%llu: declared=%u->%u read_size=%zu->%zu fragment_offset=%zu->%zu fragment_size=%zu legacy_object=0x%08X area_resref='%s' removed_object_bytes=0 inserted_post_static_count_bytes=%zu first_fragment=0x%02X->0x%02X payload=%zu",
@@ -23670,6 +28761,39 @@ bool TryParseQuickbarPacketFull(
           reader.cursor);
     }
     parsed.type = type;
+
+    if (type == 0 && LooksLikeQuickbarItemObjectBodyAt(runtime, reader, true)) {
+      QuickbarPacketReader trial = reader;
+      QuickbarButtonInventory recovered = parsed;
+      recovered.type = 1;
+      recovered.recovered_item_type_tag = true;
+      std::wstring item_failure;
+      if (ParseQuickbarItemPayload(runtime, &trial, &recovered, &item_failure) &&
+          recovered.primary_item.present &&
+          recovered.primary_item.active_props_parsed) {
+        reader = trial;
+        view->buttons[slot] = std::move(recovered);
+        ++view->item_buttons_translated;
+        ++view->item_type_tags_recovered;
+        view->score += 95;
+
+        const QuickbarButtonInventory& stored = view->buttons[slot];
+        wchar_t recovery[512]{};
+        swprintf_s(
+            recovery,
+            L"slot=%zu offset=%zu object=0x%08X base=%u name='%s'",
+            slot,
+            stored.offset,
+            stored.primary_item.object_id,
+            stored.primary_item.base_item,
+            AsciiPreviewToWide(stored.primary_item.name_preview, 64).c_str());
+        if (!view->item_type_recovery_summary.empty()) {
+          view->item_type_recovery_summary += L"; ";
+        }
+        view->item_type_recovery_summary += recovery;
+        continue;
+      }
+    }
 
     if (type == 1) {
       std::wstring item_failure;
@@ -25038,7 +30162,8 @@ bool RewriteSimpleQuickbarPayloadIfPossible(
     return RewriteQuickbarOpcodeStreamToEmptyIfPossible(runtime, payload, context);
   }
 
-  if (view.fragment_size != 0 && view.item_candidates != 0) {
+  if (view.fragment_size != 0 &&
+      (view.item_candidates != 0 || view.unsupported_buttons != 0)) {
     QuickbarFullParseView full_view;
     std::wstring parse_failure;
     if (TryParseQuickbarPacketFull(
@@ -25102,8 +30227,9 @@ bool RewriteSimpleQuickbarPayloadIfPossible(
       runtime->quickbar_item_buttons_translated_count += full_view.item_buttons_translated;
       runtime->quickbar_item_buttons_blanked_count +=
           full_view.item_buttons_blanked + full_view.unsupported_buttons_blanked;
+      runtime->quickbar_item_type_tag_recovery_count += full_view.item_type_tags_recovered;
       LogFormat(
-          L"%s quickbar item rewritten #%llu: declared=%u read_size=%zu fragment_size=%zu final_bits=%u items=%d unsupported_blanked=%d old_payload=%zu new_payload=%zu total_items=%llu summary=[%s]",
+          L"%s quickbar item rewritten #%llu: declared=%u read_size=%zu fragment_size=%zu final_bits=%u items=%d unsupported_blanked=%d type_tags_recovered=%d total_type_tags_recovered=%llu old_payload=%zu new_payload=%zu total_items=%llu summary=[%s]",
           context != nullptr ? context : L"server->client",
           static_cast<unsigned long long>(runtime->quickbar_item_rewrite_count),
           full_view.declared,
@@ -25112,10 +30238,18 @@ bool RewriteSimpleQuickbarPayloadIfPossible(
           static_cast<unsigned int>(full_view.final_fragment_bits),
           full_view.item_buttons_translated,
           full_view.unsupported_buttons_blanked,
+          full_view.item_type_tags_recovered,
+          static_cast<unsigned long long>(runtime->quickbar_item_type_tag_recovery_count),
           old_payload_length,
           payload->size(),
           static_cast<unsigned long long>(runtime->quickbar_item_buttons_translated_count),
           full_view.button_summary.c_str());
+      if (!full_view.item_type_recovery_summary.empty()) {
+        LogFormat(
+            L"%s quickbar recovered missing item type tag(s): %s",
+            context != nullptr ? context : L"server->client",
+            full_view.item_type_recovery_summary.c_str());
+      }
       return true;
     }
 
@@ -25564,6 +30698,7 @@ void ObserveLiveObjectHighLevel(
   }
 
   ++runtime->live_object_summary_count;
+  ObserveLiveObjectLifecycle(runtime, direction, payload, payload_length);
   LogFormat(
       L"%s live-object high-level summary #%llu/%llu: %s payload-len=%zu transition-related=%d %s",
       direction != nullptr ? direction : L"<unknown>",
@@ -26419,13 +31554,13 @@ bool LooksLikeSalvageableLegacyLiveObjectRecordAt(
             nullptr,
             nullptr);
   } else if (opcode == 'A' && object_type == 7) {
-    uint8_t primary_flag = 0;
+    uint8_t cursor_byte = 0;
     uint8_t vertex_count = 0;
     plausible = TryReadLegacyTriggerAddShape(
         bytes,
         record_offset,
         record_end,
-        &primary_flag,
+        &cursor_byte,
         &vertex_count);
   } else if (opcode == 'U' &&
       (object_type == 5 || object_type == 7 || object_type == 9 || object_type == 10) &&
@@ -26603,6 +31738,12 @@ bool EvaluateLiveObjectShortDeclaredExpansionCandidate(
       payload.begin() + 7,
       payload.begin() + static_cast<std::ptrdiff_t>(new_declared_size));
   if (!LooksLikeLegacyLiveObjectSubMessageBoundaryBytes(live_bytes, 0)) {
+    return false;
+  }
+  size_t incomplete_prefix_offset = 0;
+  if (LooksLikeIncompleteLegacyLiveObjectSubMessagePrefixTail(
+          live_bytes,
+          &incomplete_prefix_offset)) {
     return false;
   }
 
@@ -27188,6 +32329,24 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
       add_candidate_tail_start(
           pending_creature_p_original_tail_start + name_bits);
     }
+    constexpr size_t kCreaturePTailRepairCandidateWindowBits = 16;
+    const auto add_candidate_tail_neighborhood = [&](size_t center) {
+      if (center > pending_creature_p_original_bits.size()) {
+        return;
+      }
+      add_candidate_tail_start(center);
+      for (size_t delta = 1;
+           delta <= kCreaturePTailRepairCandidateWindowBits;
+           ++delta) {
+        if (center >= delta) {
+          add_candidate_tail_start(center - delta);
+        }
+        if (delta <= pending_creature_p_original_bits.size() - center) {
+          add_candidate_tail_start(center + delta);
+        }
+      }
+    };
+    add_candidate_tail_neighborhood(pending_creature_p_original_tail_start);
 
     std::wstring candidate_start_summary;
     for (size_t i = 0; i < candidate_tail_starts.size(); ++i) {
@@ -27201,10 +32360,14 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
     }
 
     std::vector<unsigned char> accepted_candidate_bits;
+    std::vector<unsigned char> accepted_candidate_combined;
     std::vector<unsigned char> rejected_candidate_bits;
     size_t accepted_tail_start = pending_creature_p_original_tail_start;
     size_t rejected_tail_start = pending_creature_p_original_tail_start;
     size_t accepted_trial_bit_cursor = bit_cursor;
+    bool accepted_identity_rewrite = false;
+    std::wstring accepted_identity_rewrite_detail;
+    std::wstring rejected_identity_rewrite_detail;
     std::wstring creature_advance_failure;
     bool advanced = false;
     if (!IsLegacyLiveReadBufferOnlySubMessage(
@@ -27222,33 +32385,56 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
 
         size_t trial_bit_cursor = bit_cursor;
         std::wstring candidate_failure;
-        const bool candidate_advanced =
-            AdvanceLegacyLiveDeleteRecordBitCursorForEe(
+        std::vector<unsigned char> candidate_combined = combined;
+        size_t identity_trial_bit_cursor = trial_bit_cursor;
+        std::wstring identity_rewrite_detail;
+        const bool identity_rewritten =
+            TryRewriteLegacyCreatureUpdateBareSecondIdentityString(
+                &candidate_combined,
+                record_offset,
+                record_end,
+                candidate_bits,
+                trial_bit_cursor,
+                &identity_trial_bit_cursor,
+                &identity_rewrite_detail);
+        bool candidate_advanced = false;
+        if (identity_rewritten) {
+          trial_bit_cursor = identity_trial_bit_cursor;
+          candidate_advanced = true;
+        } else {
+          candidate_advanced =
+              AdvanceLegacyLiveDeleteRecordBitCursorForEe(
                 combined,
                 record_offset,
                 record_end,
                 candidate_bits,
                 &trial_bit_cursor) ||
-            AdvanceKnownLegacyLiveCreatureBitCursor(
+              AdvanceKnownLegacyLiveCreatureBitCursor(
                 combined,
                 record_offset,
                 record_end,
                 candidate_bits,
                 &trial_bit_cursor,
                 &candidate_failure) ||
-            AdvanceLegacyLiveAddRecordBitCursor(
+              AdvanceLegacyLiveAddRecordBitCursor(
                 combined,
                 candidate_bits,
                 record_offset,
                 record_end,
                 &trial_bit_cursor) ||
-            AdvanceRewrittenLiveUpdateRecordBitCursor(
+              AdvanceRewrittenLiveUpdateRecordBitCursor(
                 combined,
                 record_offset,
                 record_end,
                 &trial_bit_cursor);
+        }
         if (candidate_advanced) {
           accepted_candidate_bits = std::move(candidate_bits);
+          if (identity_rewritten) {
+            accepted_candidate_combined = std::move(candidate_combined);
+            accepted_identity_rewrite = true;
+            accepted_identity_rewrite_detail = std::move(identity_rewrite_detail);
+          }
           accepted_tail_start = candidate_tail_start;
           accepted_trial_bit_cursor = trial_bit_cursor;
           advanced = true;
@@ -27256,6 +32442,7 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
         }
         rejected_candidate_bits = std::move(candidate_bits);
         rejected_tail_start = candidate_tail_start;
+        rejected_identity_rewrite_detail = std::move(identity_rewrite_detail);
         creature_advance_failure = std::move(candidate_failure);
       }
     } else {
@@ -27266,18 +32453,22 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
         const size_t before_slice =
             bit_cursor >= 8 ? bit_cursor - 8 : 0;
         LogFormat(
-            L"server->client live creature-P fragment tail repair candidate rejected: p_offset=%zu record_offset=%zu record_end=%zu reason=%s original_tail=%zu rejected_tail=%zu rewritten_tail=%zu inserted_bits=%u name_bits=%u candidates=[%s] bit_cursor=%zu current_bits=%zu candidate_bits=%zu original_slice=[%s] current_slice=[%s] candidate_slice=[%s] raw=[%s]",
+            L"server->client live creature-P fragment tail repair candidate rejected: p_offset=%zu record_offset=%zu record_end=%zu reason=%s identity_rewrite_probe=%s original_tail=%zu rejected_tail=%zu rewritten_tail=%zu inserted_bits=%u name_bits=%u tail_window=%zu candidates=[%s] bit_cursor=%zu current_bits=%zu candidate_bits=%zu original_slice=[%s] current_slice=[%s] candidate_slice=[%s] raw=[%s]",
             pending_creature_p_offset,
             record_offset,
             record_end,
             creature_advance_failure.empty()
                 ? L"<none>"
                 : creature_advance_failure.c_str(),
+            rejected_identity_rewrite_detail.empty()
+                ? L"<none>"
+                : rejected_identity_rewrite_detail.c_str(),
             pending_creature_p_original_tail_start,
             rejected_tail_start,
             pending_creature_p_rewritten_tail_start,
             pending_creature_p_inserted_bits,
             pending_creature_p_name_bits,
+            kCreaturePTailRepairCandidateWindowBits,
             candidate_start_summary.empty()
                 ? L"<none>"
                 : candidate_start_summary.c_str(),
@@ -27312,7 +32503,7 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
           static_cast<long long>(accepted_tail_start) -
           static_cast<long long>(pending_creature_p_original_tail_start);
       LogFormat(
-          L"server->client live creature-P fragment tail repaired: p_offset=%zu record_offset=%zu record_end=%zu original_tail=%zu accepted_tail=%zu tail_delta=%lld rewritten_tail=%zu inserted_bits=%u name_bits=%u candidates=[%s] bit_cursor=%zu->%zu before=[%s] after=[%s]",
+          L"server->client live creature-P fragment tail repaired: p_offset=%zu record_offset=%zu record_end=%zu original_tail=%zu accepted_tail=%zu tail_delta=%lld rewritten_tail=%zu inserted_bits=%u name_bits=%u identity_rewrite=%d identity_detail=%s tail_window=%zu candidates=[%s] bit_cursor=%zu->%zu before=[%s] after=[%s]",
           pending_creature_p_offset,
           record_offset,
           record_end,
@@ -27322,6 +32513,11 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
           pending_creature_p_rewritten_tail_start,
           pending_creature_p_inserted_bits,
           pending_creature_p_name_bits,
+          accepted_identity_rewrite ? 1 : 0,
+          accepted_identity_rewrite_detail.empty()
+              ? L"<none>"
+              : accepted_identity_rewrite_detail.c_str(),
+          kCreaturePTailRepairCandidateWindowBits,
           candidate_start_summary.empty()
               ? L"<none>"
               : candidate_start_summary.c_str(),
@@ -27332,6 +32528,19 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
     }
 
     fragment_bits = std::move(accepted_candidate_bits);
+    if (accepted_identity_rewrite && !accepted_candidate_combined.empty()) {
+      combined = std::move(accepted_candidate_combined);
+      rewritten_any = true;
+      if (runtime->options.packet_dump) {
+        LogFormat(
+            L"server->client live creature-U identity bare-string rewritten after creature-P tail repair: offset=%zu end=%zu detail=%s",
+            record_offset,
+            record_end,
+            accepted_identity_rewrite_detail.empty()
+                ? L"<none>"
+                : accepted_identity_rewrite_detail.c_str());
+      }
+    }
     bit_cursor = accepted_trial_bit_cursor;
     fragment_bits_changed = true;
     clear_pending_creature_p_tail_repair();
@@ -27468,8 +32677,34 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
                   runtime);
           const size_t probe_end =
               shape_ok ? shape.record_end : (next > offset ? next : declared_live_end);
+          uint32_t logged_base_item_id = shape_ok ? shape.base_item_id : 0;
+          int logged_model_type = shape_ok ? shape.model_type : -1;
+          int logged_wire_model_type = shape_ok ? shape.wire_model_type : -1;
+          if (!shape_ok &&
+              offset + 3 < combined.size() &&
+              combined[offset] == 'G' &&
+              combined[offset + 2] == 'A') {
+            size_t appearance_probe_offset = 0;
+            if ((combined[offset + 1] == 'I' || combined[offset + 1] == 'i') &&
+                offset + 15 <= combined.size()) {
+              appearance_probe_offset = offset + 11;
+            } else if (
+                (combined[offset + 1] == 'R' || combined[offset + 1] == 'r') &&
+                offset + 13 <= combined.size()) {
+              appearance_probe_offset = offset + 9;
+            }
+            if (appearance_probe_offset != 0 &&
+                appearance_probe_offset + 4 <= combined.size()) {
+              logged_base_item_id =
+                  ReadU32Le(combined.data() + appearance_probe_offset);
+              logged_model_type =
+                  runtime != nullptr
+                      ? GetBaseItemModelType(*runtime, logged_base_item_id)
+                      : -1;
+            }
+          }
           LogFormat(
-              L"server->client live GUI item-create rewrite skipped: offset=%zu kind=%c%c%c shape=%d record_end=%zu active=%zu base=%u model=%d bit_cursor=%zu fragments=%zu next=%zu reason=%s prefix=[%s]",
+              L"server->client live GUI item-create rewrite skipped: offset=%zu kind=%c%c%c shape=%d record_end=%zu active=%zu base=%u model=%d wire_model=%d compact=%d bit_cursor=%zu fragments=%zu next=%zu reason=%s prefix=[%s]",
               offset,
               static_cast<wchar_t>(combined[offset]),
               static_cast<wchar_t>(offset + 1 < combined.size() ? combined[offset + 1] : 0),
@@ -27477,8 +32712,10 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
               shape_ok ? 1 : 0,
               shape_ok ? shape.record_end : 0,
               shape_ok ? shape.active_offset : 0,
-              shape_ok ? shape.base_item_id : 0,
-              shape_ok ? shape.model_type : -1,
+              logged_base_item_id,
+              logged_model_type,
+              logged_wire_model_type,
+              shape_ok && shape.compact_appearance_expansion ? 1 : 0,
               record_bit_cursor_snapshot,
               restored_fragment_count,
               next,
@@ -27603,7 +32840,29 @@ bool RewriteLiveCreaturePFeatureGatesPayloadIfPossible(
             clear_pending_creature_p_tail_repair();
           } else {
             bit_cursor = bit_cursor_before_probe;
-            if (!try_repair_pending_creature_p_tail_for_record(offset, record_end)) {
+            size_t identity_rewrite_bit_cursor = bit_cursor;
+            std::wstring identity_rewrite_detail;
+            if (TryRewriteLegacyCreatureUpdateBareSecondIdentityString(
+                    &combined,
+                    offset,
+                    record_end,
+                    fragment_bits,
+                    bit_cursor,
+                    &identity_rewrite_bit_cursor,
+                    &identity_rewrite_detail)) {
+              bit_cursor = identity_rewrite_bit_cursor;
+              rewritten_any = true;
+              clear_pending_creature_p_tail_repair();
+              if (runtime->options.packet_dump) {
+                LogFormat(
+                    L"server->client live creature-U identity bare-string rewritten: offset=%zu end=%zu detail=%s",
+                    offset,
+                    record_end,
+                    identity_rewrite_detail.empty()
+                        ? L"<none>"
+                        : identity_rewrite_detail.c_str());
+              }
+            } else if (!try_repair_pending_creature_p_tail_for_record(offset, record_end)) {
               mark_fragment_cursor_unreliable(
                   L"known-record-bit-advance",
                   offset,
@@ -28752,6 +34011,8 @@ bool RewriteLiveObjectAddRecordsPayloadIfPossible(
   runtime->live_object_add_record_trigger_rewrite_count +=
       local.trigger_records_rewritten;
   runtime->live_object_add_record_bits_insert_count += local.bits_inserted;
+  runtime->live_object_add_record_placeable_name_direct_repair_count +=
+      local.placeable_name_mode_direct_repairs;
   if (result != nullptr) {
     *result = std::move(local);
   }
@@ -28792,7 +34053,7 @@ bool RewriteLiveObjectAddRecordsIfPossible(
   const uint16_t new_crc = packet->size() >= 3 ? ReadU16Be(packet->data() + 1) : 0;
 
   LogFormat(
-      L"server->client live-object add records rewritten #%llu: envelope=0x%02X declared=%u->%u old_payload=%zu new_payload=%zu trailing_preserved=%zu records=%u rewritten=%u short_skips=%u skip_bytes=%u skip_bits=%u short_names=%u triggers=%u bits_set=%u bits_inserted=%u trim_bits=%u fragments=%u->%u total_short=%llu total_short_skips=%llu total_skip_bytes=%llu total_trigger=%llu total_bits=%llu pkt_len_updated=%d crc_updated=%d crc=0x%04X->0x%04X details=[%s]",
+      L"server->client live-object add records rewritten #%llu: envelope=0x%02X declared=%u->%u old_payload=%zu new_payload=%zu trailing_preserved=%zu records=%u rewritten=%u short_skips=%u skip_bytes=%u skip_bits=%u short_names=%u triggers=%u bits_set=%u bits_inserted=%u trim_bits=%u fragments=%u->%u placeable_name_suspicious=%u placeable_name_direct_repairs=%u total_short=%llu total_short_skips=%llu total_skip_bytes=%llu total_trigger=%llu total_bits=%llu total_placeable_name_direct_repairs=%llu pkt_len_updated=%d crc_updated=%d crc=0x%04X->0x%04X details=[%s]",
       static_cast<unsigned long long>(runtime->live_object_add_record_rewrite_count),
       result.envelope,
       result.old_declared,
@@ -28812,11 +34073,14 @@ bool RewriteLiveObjectAddRecordsIfPossible(
       result.fragment_bits_trimmed,
       result.old_fragment_bytes,
       result.new_fragment_bytes,
+      result.placeable_name_mode_suspicious,
+      result.placeable_name_mode_direct_repairs,
       static_cast<unsigned long long>(runtime->live_object_add_record_short_locstring_flatten_count),
       static_cast<unsigned long long>(runtime->live_object_add_record_short_add_skip_count),
       static_cast<unsigned long long>(runtime->live_object_add_record_short_add_skip_byte_count),
       static_cast<unsigned long long>(runtime->live_object_add_record_trigger_rewrite_count),
       static_cast<unsigned long long>(runtime->live_object_add_record_bits_insert_count),
+      static_cast<unsigned long long>(runtime->live_object_add_record_placeable_name_direct_repair_count),
       packetized_length_updated ? 1 : 0,
       crc_updated ? 1 : 0,
       old_crc,
@@ -31144,7 +36408,7 @@ bool RewriteInflatedServerGameplayPayloadIfPossible(
   }
   if (add_records_rewritten) {
     LogFormat(
-        L"server->client inflated live-object add-record rewrite: envelope=0x%02X declared=%u->%u records=%u rewritten=%u short_skips=%u skip_bytes=%u skip_bits=%u short_names=%u triggers=%u bits_set=%u bits_inserted=%u trim_bits=%u fragments=%u->%u details=[%s]",
+        L"server->client inflated live-object add-record rewrite: envelope=0x%02X declared=%u->%u records=%u rewritten=%u short_skips=%u skip_bytes=%u skip_bits=%u short_names=%u triggers=%u bits_set=%u bits_inserted=%u trim_bits=%u fragments=%u->%u placeable_name_suspicious=%u placeable_name_direct_repairs=%u details=[%s]",
         add_record_result.envelope,
         add_record_result.old_declared,
         add_record_result.new_declared,
@@ -31160,6 +36424,8 @@ bool RewriteInflatedServerGameplayPayloadIfPossible(
         add_record_result.fragment_bits_trimmed,
         add_record_result.old_fragment_bytes,
         add_record_result.new_fragment_bytes,
+        add_record_result.placeable_name_mode_suspicious,
+        add_record_result.placeable_name_mode_direct_repairs,
         add_record_result.details.empty() ? L"<none>" : add_record_result.details.c_str());
     if (!add_record_result.diagnostics.empty()) {
       LogFormat(
@@ -33635,7 +38901,7 @@ bool EmitReassembledServerLiveObjectFrames(
   }
   if (add_records_rewritten) {
     LogFormat(
-        L"server->client live-object reassembled add-record rewrite #%llu: envelope=0x%02X declared=%u->%u records=%u rewritten=%u short_skips=%u skip_bytes=%u skip_bits=%u short_names=%u triggers=%u bits_set=%u bits_inserted=%u trim_bits=%u fragments=%u->%u total_short=%llu total_short_skips=%llu total_skip_bytes=%llu total_trigger=%llu total_bits=%llu details=[%s]",
+        L"server->client live-object reassembled add-record rewrite #%llu: envelope=0x%02X declared=%u->%u records=%u rewritten=%u short_skips=%u skip_bytes=%u skip_bits=%u short_names=%u triggers=%u bits_set=%u bits_inserted=%u trim_bits=%u fragments=%u->%u placeable_name_suspicious=%u placeable_name_direct_repairs=%u total_short=%llu total_short_skips=%llu total_skip_bytes=%llu total_trigger=%llu total_bits=%llu total_placeable_name_direct_repairs=%llu details=[%s]",
         static_cast<unsigned long long>(runtime->live_object_reassembly_rewritten_count),
         add_record_result.envelope,
         add_record_result.old_declared,
@@ -33652,11 +38918,14 @@ bool EmitReassembledServerLiveObjectFrames(
         add_record_result.fragment_bits_trimmed,
         add_record_result.old_fragment_bytes,
         add_record_result.new_fragment_bytes,
+        add_record_result.placeable_name_mode_suspicious,
+        add_record_result.placeable_name_mode_direct_repairs,
         static_cast<unsigned long long>(runtime->live_object_add_record_short_locstring_flatten_count),
         static_cast<unsigned long long>(runtime->live_object_add_record_short_add_skip_count),
         static_cast<unsigned long long>(runtime->live_object_add_record_short_add_skip_byte_count),
         static_cast<unsigned long long>(runtime->live_object_add_record_trigger_rewrite_count),
         static_cast<unsigned long long>(runtime->live_object_add_record_bits_insert_count),
+        static_cast<unsigned long long>(runtime->live_object_add_record_placeable_name_direct_repair_count),
         add_record_result.details.empty() ? L"<none>" : add_record_result.details.c_str());
     if (!add_record_result.diagnostics.empty()) {
       LogFormat(
@@ -34158,6 +39427,7 @@ bool TransformClientToServer(BridgeRuntime* runtime, std::vector<unsigned char>*
   if (packet->front() == 'M') {
     ObserveGameplayPacket(runtime, L"client->server", packet->data(), packet->size());
     ObserveLatestClientSequenceFromClient(runtime, *packet);
+    CancelPendingSyntheticAreaLoadedForNativeClientPacket(runtime, *packet);
     MaybeReleasePendingSyntheticAreaLoadedAfterClientAck(runtime, *packet);
     ObserveClientVaultListStartupMessage(runtime, *packet);
   }
@@ -34736,6 +40006,103 @@ bool EncryptEeServerPacketIfNeeded(BridgeRuntime* runtime, std::vector<unsigned 
       static_cast<unsigned long long>(runtime->ee_crypto_encrypt_count));
   *packet = std::move(encrypted);
   return true;
+}
+
+bool SendServerToClientPlainPacket(
+    BridgeRuntime* runtime,
+    SOCKET client_socket,
+    uint64_t session_id,
+    const std::vector<unsigned char>& plain_packet,
+    const wchar_t* direction) {
+  if (runtime == nullptr || plain_packet.empty()) {
+    return false;
+  }
+  if (!runtime->has_active_client) {
+    LogFormat(
+        L"%s packet dropped because no EE-side client is active: session=%llu plain=%s",
+        direction != nullptr ? direction : L"server->client",
+        static_cast<unsigned long long>(session_id),
+        PacketPrefix(plain_packet.data(), plain_packet.size()).c_str());
+    return false;
+  }
+
+  std::vector<unsigned char> outbound = plain_packet;
+  if (!EncryptEeServerPacketIfNeeded(runtime, &outbound)) {
+    return false;
+  }
+
+  const int sent = SendPeer(client_socket, runtime->active_client, outbound.data(), outbound.size());
+  const int send_error = sent == static_cast<int>(outbound.size()) ? 0 : WSAGetLastError();
+  LogPacketDumpSendResult(runtime, direction, plain_packet, outbound, sent, send_error);
+  LogCriticalBnControlSendResult(runtime, direction, plain_packet, sent, outbound.size(), send_error);
+  LogCriticalGameplaySendResult(runtime, direction, plain_packet, sent, outbound.size(), send_error);
+  if (sent != static_cast<int>(outbound.size())) {
+    LogFormat(
+        L"sendto client packet failed: session=%llu direction=%s sent=%d length=%zu error=%d",
+        static_cast<unsigned long long>(session_id),
+        direction != nullptr ? direction : L"server->client",
+        sent,
+        outbound.size(),
+        send_error);
+    return false;
+  }
+  return true;
+}
+
+void FlushDueServerToClientPackets(ClientSession* session, SOCKET client_socket) {
+  if (session == nullptr) {
+    return;
+  }
+  BridgeRuntime* runtime = &session->runtime;
+  if (runtime->pending_server_to_client_packets.empty() || !runtime->has_active_client) {
+    return;
+  }
+
+  const ULONGLONG now_tick = GetTickCount64();
+  std::vector<PendingServerPacket> due;
+  std::vector<PendingServerPacket> remaining;
+  due.reserve(runtime->pending_server_to_client_packets.size());
+  remaining.reserve(runtime->pending_server_to_client_packets.size());
+  for (PendingServerPacket& packet : runtime->pending_server_to_client_packets) {
+    if (now_tick >= packet.due_tick) {
+      due.push_back(std::move(packet));
+    } else {
+      remaining.push_back(std::move(packet));
+    }
+  }
+  runtime->pending_server_to_client_packets = std::move(remaining);
+  if (due.empty()) {
+    return;
+  }
+
+  for (PendingServerPacket& packet : due) {
+    GameplayWrapperView view;
+    const bool have_view =
+        TryParseGameplayWrapper(packet.bytes.data(), packet.bytes.size(), &view);
+    LogFormat(
+        L"server->client delayed synthetic packet releasing: session=%llu reason=%s due_tick=%llu now_tick=%llu late_ms=%llu seq=%s%u ack=%s%u length=%zu remaining_delayed=%zu prefix=%s",
+        static_cast<unsigned long long>(session->id),
+        packet.reason.empty() ? L"<unknown>" : packet.reason.c_str(),
+        static_cast<unsigned long long>(packet.due_tick),
+        static_cast<unsigned long long>(now_tick),
+        static_cast<unsigned long long>(now_tick >= packet.due_tick ? now_tick - packet.due_tick : 0),
+        have_view ? L"" : L"unknown/",
+        have_view ? view.sequence : 0,
+        have_view ? L"" : L"unknown/",
+        have_view ? view.ack_sequence : 0,
+        packet.bytes.size(),
+        runtime->pending_server_to_client_packets.size(),
+        PacketPrefix(packet.bytes.data(), packet.bytes.size()).c_str());
+    if (!packet.bytes.empty() && packet.bytes.front() == 'M') {
+      ObserveGameplayPacket(runtime, L"server->client delayed", packet.bytes.data(), packet.bytes.size());
+    }
+    SendServerToClientPlainPacket(
+        runtime,
+        client_socket,
+        session->id,
+        packet.bytes,
+        L"server->client delayed");
+  }
 }
 
 void ReplayQueuedStartupPackets(BridgeRuntime* runtime, SOCKET server_socket) {
@@ -35924,7 +41291,7 @@ int RunProxy(Options options) {
   InitializeNwsyncOptions(&options);
 
   LogFormat(
-      L"hgbridge_proxy v%s starting listen=%s server=%s log=%s allow_remote=%d packet_dump=%d ee_crypto=%d ee_nwmain_hint=%s startup_gate=%d quarantine_ee_controls=%d consume_device_properties=%d rewrite_client_gui_inventory_self=%d rewrite_client_input_self=%d rewrite_bncs_private=%d private_build=%u rewrite_bncs=%d field=0x%04X rewrite_live_visual=%d rewrite_live_material=%d rewrite_live_item_visual=%d rewrite_live_inventory23=%d rewrite_live_add_records=%d rewrite_live_add_visual=%d synth_area_loadbar=%d synth_area_loaded=%d nwsync_advert=%d nwsync_http=%d nwsync_root=%s nwsync_hash=%s nwsync_url=%s session_timeout_ms=%u diamond_cdkey=%s baseitems=%s genericdoors=%s compat=BNK0-4+BN-control+M-payload-observer+EE-direct-control-quarantine+client-device-property-consume+client-gui-inventory-self-id-rewrite+client-input-self-id-rewrite+serverstatus-module-resources-nwsync+module-info-reassembly+module-info-loadmodule-hak-strip+BNXR-nwsync-advert+deflated-stream-retransmit-guard+quickbar-inventory+quickbar-reassembly+quickbar-simple-rewrite+quickbar-opcode-stream-blank+quickbar-item-rewrite+player-list-identity-rewrite+area-client-area-name-tail-rewrite+area-loadbar-M-inject+bidirectional-sequence-shift+inflated-live-object-rewrite+live-object-summary+live-object-reassembly+live-object-update-rewrite+live-creature-associate-tail-diagnostics+live-visual-transform-mask-rewrite+live-material-shader-rewrite+live-item-appearance-rewrite+live-item-visual-transform-map-rewrite+live-inventory-feature23-category-padding-opt-in+live-add-record-rewrite+live-add-visual-transform-map-rewrite+BNCS-private-build-rewrite+BNVS-rewrite+EE-BNK-crypto",
+      L"hgbridge_proxy v%s starting listen=%s server=%s log=%s allow_remote=%d packet_dump=%d ee_crypto=%d ee_nwmain_hint=%s startup_gate=%d quarantine_ee_controls=%d consume_device_properties=%d rewrite_client_gui_inventory_self=%d rewrite_client_input_self=%d rewrite_bncs_private=%d private_build=%u rewrite_bncs=%d field=0x%04X rewrite_live_visual=%d rewrite_live_material=%d rewrite_live_item_visual=%d rewrite_live_inventory23=%d rewrite_live_add_records=%d rewrite_live_add_visual=%d synth_area_loadbar=%d synth_area_loaded=%d synth_area_delay_ms=%u synth_area_loaded_fallback_ms=%u nwsync_advert=%d nwsync_http=%d nwsync_root=%s nwsync_hash=%s nwsync_url=%s session_timeout_ms=%u diamond_cdkey=%s baseitems=%s genericdoors=%s compat=BNK0-4+BN-control+M-payload-observer+EE-direct-control-quarantine+client-device-property-consume+client-gui-inventory-self-id-rewrite+client-input-self-id-rewrite+serverstatus-module-resources-nwsync+module-info-reassembly+module-info-loadmodule-hak-strip+BNXR-nwsync-advert+deflated-stream-retransmit-guard+quickbar-inventory+quickbar-reassembly+quickbar-simple-rewrite+quickbar-opcode-stream-blank+quickbar-item-rewrite+player-list-identity-rewrite+area-client-area-name-tail-rewrite+area-loadbar-M-inject+bidirectional-sequence-shift+inflated-live-object-rewrite+live-object-summary+live-object-reassembly+live-object-update-rewrite+live-creature-associate-tail-diagnostics+live-visual-transform-mask-rewrite+live-material-shader-rewrite+live-item-appearance-rewrite+live-item-visual-transform-map-rewrite+live-inventory-feature23-category-padding-opt-in+live-add-record-rewrite+live-add-visual-transform-map-rewrite+BNCS-private-build-rewrite+BNVS-rewrite+EE-BNK-crypto",
       kProxyVersion,
       FormatEndpoint(options.listen_host, options.listen_port).c_str(),
       options.server_address.c_str(),
@@ -35950,6 +41317,8 @@ int RunProxy(Options options) {
       options.rewrite_live_object_add_visual_transforms ? 1 : 0,
       options.synthesize_area_loadbar ? 1 : 0,
       options.synthesize_area_loaded ? 1 : 0,
+      options.synthetic_area_load_completion_delay_ms,
+      kDefaultSyntheticAreaLoadedFallbackGraceMs,
       options.enable_nwsync_advertisement ? 1 : 0,
       options.enable_nwsync_http ? 1 : 0,
       options.nwsync_root_path.empty() ? L"<none>" : options.nwsync_root_path.c_str(),
@@ -36090,6 +41459,11 @@ int RunProxy(Options options) {
 
   for (;;) {
     ExpireIdleClientSessions(&state, GetTickCount64());
+    for (ClientSession& session : state.sessions) {
+      FlushDueServerToClientPackets(&session, client_socket.get());
+      MaybeReleasePendingSyntheticAreaLoadedAfterLatestAck(&session.runtime);
+      FlushPendingClientToServerPackets(&session.runtime, session.server_socket.get(), session.id);
+    }
 
     fd_set reads;
     FD_ZERO(&reads);
@@ -36098,8 +41472,8 @@ int RunProxy(Options options) {
       FD_SET(session.server_socket.get(), &reads);
     }
     timeval timeout{};
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 250000;
     const int ready = select(0, &reads, nullptr, nullptr, &timeout);
     if (ready == SOCKET_ERROR) {
       const int error = WSAGetLastError();
@@ -36107,6 +41481,11 @@ int RunProxy(Options options) {
       return 1;
     }
     if (ready == 0) {
+      for (ClientSession& session : state.sessions) {
+        FlushDueServerToClientPackets(&session, client_socket.get());
+        MaybeReleasePendingSyntheticAreaLoadedAfterLatestAck(&session.runtime);
+        FlushPendingClientToServerPackets(&session.runtime, session.server_socket.get(), session.id);
+      }
       continue;
     }
 
@@ -36117,6 +41496,11 @@ int RunProxy(Options options) {
       if (FD_ISSET(session.server_socket.get(), &reads)) {
         HandleServerDatagram(&session, client_socket.get());
       }
+    }
+    for (ClientSession& session : state.sessions) {
+      FlushDueServerToClientPackets(&session, client_socket.get());
+      MaybeReleasePendingSyntheticAreaLoadedAfterLatestAck(&session.runtime);
+      FlushPendingClientToServerPackets(&session.runtime, session.server_socket.get(), session.id);
     }
   }
 }

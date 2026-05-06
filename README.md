@@ -210,3 +210,7 @@ Diamond-format account files for the selected account, such as
 `1.nwncdkey.ini` and `1.nwnplayer.ini`. The launcher uses those local files to
 seed the legacy CD-key and password paths expected by HG. Keep credentials and
 CD-key files private.
+
+## Progress Log
+
+- 2026-05-06 `0086d7c`: improved proxy live-object/placeable/trigger alignment, quickbar recovery, area-load scheduling, and local asset-bundle baseitems staging.
